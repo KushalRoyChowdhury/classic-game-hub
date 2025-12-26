@@ -188,6 +188,10 @@ io.on("connection", (socket) => {
     });
 });
 
+app.get("/health", (req, res) => {
+    res.status(200).send();
+});
+
 const startGC = require('./GC');
 
 // Start Garbage Collection (Runs every 3 minutes)

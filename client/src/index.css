@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@media (pointer: fine) {
+    * {
+        cursor: none !important;
+    }
+}
+
+* {
+    color-scheme: dark;
+}

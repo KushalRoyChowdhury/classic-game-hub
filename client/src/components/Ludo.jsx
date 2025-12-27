@@ -72,6 +72,7 @@ function Ludo() {
     const [onlineView, setOnlineView] = useState('menu'); // 'menu', 'create', 'join'
     const [myIndex, setMyIndex] = useState(null);
     const [serverMaxPlayers, setServerMaxPlayers] = useState(4);
+    const [connectedPlayers, setConnectedPlayers] = useState(0);
     const [turnPhase, setTurnPhase] = useState('ROLL'); // 'ROLL' or 'MOVE'
     const [rematchRequestedBy, setRematchRequestedBy] = useState(null);
 
@@ -137,6 +138,10 @@ function Ludo() {
         });
 
         socket.on("receive_message", (data) => {
+            if (data.seats) {
+                setConnectedPlayers(data.seats.filter(s => s !== null).length);
+            }
+
             if (data.players) {
                 // Sync Players & Transform tokens from Server (Array of Numbers) to Client (Array of Objects)
                 const transformedPlayers = data.players.map(p => ({
@@ -248,6 +253,7 @@ function Ludo() {
         setGameState('setup');
         setGameMode('pve');
         setRematchRequestedBy(null);
+        sessionStorage.removeItem('ludo_room');
     };
 
     const requestRematch = () => {
@@ -512,6 +518,7 @@ function Ludo() {
                             else {
                                 setGameState('setup');
                                 setGameMode('pve');
+                                sessionStorage.removeItem('ludo_game_state');
                             }
                         }}
                         className="absolute right-0 top-1/2 -translate-y-1/2 bg-red-500/20 hover:bg-red-500/40 text-red-300 px-4 py-2 rounded-lg font-bold text-sm transition-all border border-red-500/20"
@@ -856,11 +863,11 @@ function Ludo() {
                                     whileHover={{ scale: players[turn]?.isAi || dice ? 1 : 1.05 }}
                                     whileTap={{ scale: players[turn]?.isAi || dice ? 1 : 0.95 }}
                                     onClick={rollDice}
-                                    disabled={rolling || winner || players[turn]?.isAi || dice !== null || (gameMode === 'online' && turn !== myIndex)}
+                                    disabled={rolling || winner || players[turn]?.isAi || dice !== null || (gameMode === 'online' && (turn !== myIndex || connectedPlayers < serverMaxPlayers))}
                                     className={`
                                         w-20 h-20 rounded-2xl border-2 flex items-center justify-center text-4xl font-black shadow-lg
                                         ${rolling ? 'animate-spin' : ''} transition-all
-                                        ${players[turn]?.isAi || dice || (gameMode === 'online' && turn !== myIndex)
+                                        ${players[turn]?.isAi || dice || (gameMode === 'online' && (turn !== myIndex || connectedPlayers < serverMaxPlayers))
                                             ? 'bg-gray-700 border-gray-600 text-gray-500 cursor-not-allowed opacity-50'
                                             : 'bg-white text-black border-white hover:bg-gray-100 cursor-pointer'}
                                     `}
@@ -868,7 +875,7 @@ function Ludo() {
                                     {rolling ? <RefreshCcw /> : (dice || <Dice5 />)}
                                 </motion.button>
                                 <p className="text-xs text-gray-400 text-center">
-                                    {dice ? 'Select a token' : players[turn]?.isAi ? 'AI thinking...' : (gameMode === 'online' && turn !== myIndex) ? `Waiting for ${players[turn]?.color}...` : 'Roll dice'}
+                                    {dice ? 'Select a token' : players[turn]?.isAi ? 'AI thinking...' : (gameMode === 'online' && connectedPlayers < serverMaxPlayers) ? `Waiting for players (${connectedPlayers}/${serverMaxPlayers})...` : (gameMode === 'online' && turn !== myIndex) ? `Waiting for ${players[turn]?.color}...` : 'Roll dice'}
                                 </p>
                             </div>
                         </div>

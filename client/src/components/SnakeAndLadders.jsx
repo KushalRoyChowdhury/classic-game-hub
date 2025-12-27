@@ -70,6 +70,7 @@ function SnakeAndLadders() {
     const [onlineView, setOnlineView] = useState('menu'); // 'menu', 'create', 'join'
     const [myIndex, setMyIndex] = useState(null);
     const [serverMaxPlayers, setServerMaxPlayers] = useState(2);
+    const [connectedPlayers, setConnectedPlayers] = useState(0);
     const [rematchRequestedBy, setRematchRequestedBy] = useState(null);
 
     // Persistence load
@@ -168,7 +169,14 @@ function SnakeAndLadders() {
                 setBoard(newBoard);
             }
 
-            if (data.winner) setWinner(data.winner);
+            if (data.winner) {
+                const winnerConfig = PLAYER_CONFIGS[(data.winner.id - 1)] || PLAYER_CONFIGS[0];
+                setWinner({ ...data.winner, config: winnerConfig });
+            }
+
+            if (data.seats) {
+                setConnectedPlayers(data.seats.filter(s => s !== null).length);
+            }
         });
 
         socket.on("error_message", (msg) => {
@@ -579,13 +587,13 @@ function SnakeAndLadders() {
 
                         <motion.button
                             onClick={rollDice}
-                            disabled={isRolling || winner || (gameMode === 'pve' && currentPlayerIndex !== 0) || (gameMode === 'online' && myIndex !== currentPlayerIndex)}
+                            disabled={isRolling || winner || (gameMode === 'pve' && currentPlayerIndex !== 0) || (gameMode === 'online' && (myIndex !== currentPlayerIndex || connectedPlayers < serverMaxPlayers))}
                             whileHover={{ scale: 1.05 }}
                             whileTap={{ scale: 0.95 }}
                             className={`
                                 w-24 h-24 rounded-2xl border-2 flex items-center justify-center text-5xl font-black shadow-xl
                                 ${isRolling ? 'animate-spin border-t-transparent' : ''}
-                                ${(gameMode === 'pve' && currentPlayerIndex !== 0) || (gameMode === 'online' && myIndex !== currentPlayerIndex)
+                                ${(gameMode === 'pve' && currentPlayerIndex !== 0) || (gameMode === 'online' && (myIndex !== currentPlayerIndex || connectedPlayers < serverMaxPlayers))
                                     ? 'bg-gray-800 border-gray-700 text-gray-600 opacity-50 cursor-not-allowed'
                                     : 'bg-gradient-to-br from-white to-gray-200 border-white text-black cursor-pointer hover:shadow-2xl'}
                             `}
@@ -594,8 +602,9 @@ function SnakeAndLadders() {
                         </motion.button>
                         <p className="mt-4 text-sm text-gray-400 text-center font-mono">
                             {(gameMode === 'pve' && currentPlayerIndex !== 0) ? "AI is thinking..." :
-                                (gameMode === 'online' && myIndex !== currentPlayerIndex) ? "Waiting for opponent..." :
-                                    "Click to Roll"}
+                                (gameMode === 'online' && connectedPlayers < serverMaxPlayers) ? `Waiting for players (${connectedPlayers}/${serverMaxPlayers})...` :
+                                    (gameMode === 'online' && myIndex !== currentPlayerIndex) ? "Waiting for opponent..." :
+                                        "Click to Roll"}
                         </p>
                     </div>
 

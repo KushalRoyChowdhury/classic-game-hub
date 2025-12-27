@@ -100,6 +100,7 @@ class SnakeAndLadders {
             let nextPos = player.pos + steps;
             if (nextPos > 100) {
                 nextPos = player.pos; // Overshoot
+                logMsg += " -> Too high!";
             } else {
                 // Check Snakes/Ladders
                 if (this.board.snakes[nextPos]) {
@@ -124,7 +125,14 @@ class SnakeAndLadders {
             // Simplified: Just update index. If seat is empty, logic elsewhere handles it? 
             // No, games usually shouldn't start until full or logic skips.
             // Loop until we find the next player index?
-            this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.maxPlayers;
+            // Find next occupied seat
+            let next = (this.currentPlayerIndex + 1) % this.maxPlayers;
+            let checked = 0;
+            while (this.seats[next] === null && checked < this.maxPlayers) {
+                next = (next + 1) % this.maxPlayers;
+                checked++;
+            }
+            this.currentPlayerIndex = next;
         }
 
         return { valid: true, state: this.getState() };

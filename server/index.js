@@ -27,11 +27,9 @@ const socketRoomMap = new Map();
 io.on("connection", (socket) => {
     // console.log(`User Connected: ${socket.id}`);
 
-    // Ping/Pong for Latency Check (with 10ms synthetic delay)
+    // Ping/Pong for Latency Check
     socket.on("ping", (cb) => {
-        setTimeout(() => {
-            if (typeof cb === "function") cb();
-        }, 10);
+        if (typeof cb === "function") cb();
     });
 
     // Join a room with strict Create/Join logic
@@ -97,19 +95,15 @@ io.on("connection", (socket) => {
                 role = `P${seatIndex + 1}`;
             }
 
-            socket.emit("player_role", { role, index: seatIndex });
+            socket.emit("player_role", { role, index: seatIndex, maxPlayers: game.maxPlayers || 2 });
             socket.to(roomId).emit("user_joined", { role, index: seatIndex });
 
             // Emit Full State
-            setTimeout(() => {
-                io.to(roomId).emit("receive_message", game.getState());
-            }, 10);
+            io.to(roomId).emit("receive_message", game.getState());
         } else {
             socket.emit("room_full");
             // Also send state for spectating
-            setTimeout(() => {
-                socket.emit("receive_message", game.getState());
-            }, 10);
+            socket.emit("receive_message", game.getState());
         }
     });
 
@@ -139,9 +133,7 @@ io.on("connection", (socket) => {
         if (game) {
             const result = game.handleMove(socket.id, data);
             if (result.valid) {
-                setTimeout(() => {
-                    io.to(roomId).emit("receive_message", result.state);
-                }, 10);
+                io.to(roomId).emit("receive_message", result.state);
             } else {
                 socket.emit("error_message", result.error);
                 console.log(`Move Error in ${roomId}: ${result.error}`);

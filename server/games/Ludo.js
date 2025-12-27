@@ -198,8 +198,14 @@ class Ludo {
         this.turnPhase = 'ROLL';
 
         let next = (this.currentTurn + 1) % 4;
-        while (!this.players[next].isActive) {
+        // Skip inactive, empty seats, or finished players (optional but good)
+        // Ludo usually ends when one player wins (simplification), but if continuing, we'd check finished.
+        // Here we just fix the "empty seat" bug.
+        // We need a safety counter to avoid infinite loop if NO ONE is valid (shouldn't happen in game)
+        let checked = 0;
+        while ((!this.players[next].isActive || this.seats[next] === null) && checked < 4) {
             next = (next + 1) % 4;
+            checked++;
         }
         this.currentTurn = next;
     }

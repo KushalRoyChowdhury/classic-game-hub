@@ -1,387 +1,311 @@
 import React, { useEffect, useState, useRef } from 'react';
-import Peer from 'simple-peer';
 import socket from '../socket';
-import { Mic, MicOff, Volume2, VolumeX, X, Phone, Users, Radio } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, X, Phone, Radio } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// Polyfills for simple-peer in Vite environment
-import { Buffer } from 'buffer';
-import process from 'process';
-
-if (typeof window !== 'undefined') {
-    if (!window.global) window.global = window;
-    if (!window.Buffer) window.Buffer = Buffer;
-    if (!window.process) window.process = process;
-    // Essential for simple-peer/readable-stream
-    if (!window.process.nextTick) {
-        window.process.nextTick = (cb, ...args) => setTimeout(() => cb(...args), 0);
-    }
-}
-
-// Separate component for rendering audio allows for better react lifecycle management of streams
-const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
-    const audioRef = useRef();
-
-    useEffect(() => {
-        if (audioRef.current && stream) {
-            audioRef.current.srcObject = stream;
-            // Force play for mobile browsers
-            audioRef.current.play().catch(e => console.log("[VoiceChat] Playback blocked or failed:", e));
-        }
-
-        // Voice activity detection
-        let audioContext;
-        let analyser;
-        let source;
-        let animationFrame;
-
-        try {
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            analyser = audioContext.createAnalyser();
-
-            // Wait for context to be running
-            if (audioContext.state === 'suspended') {
-                audioContext.resume();
-            }
-
-            source = audioContext.createMediaStreamSource(stream);
-            source.connect(analyser);
-            analyser.fftSize = 64;
-            const bufferLength = analyser.frequencyBinCount;
-            const dataArray = new Uint8Array(bufferLength);
-
-            const checkVolume = () => {
-                // Persistent resume attempt
-                if (audioContext.state === 'suspended') {
-                    audioContext.resume().catch(e => { });
-                }
-
-                analyser.getByteFrequencyData(dataArray);
-                let sum = 0;
-                for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
-                const avg = sum / bufferLength;
-                if (onVolumeChange) onVolumeChange(avg);
-                animationFrame = requestAnimationFrame(checkVolume);
-            };
-            checkVolume();
-
-            console.log("[AudioPlayer] Initialized for track:", stream.getAudioTracks()[0]?.label);
-        } catch (e) {
-            console.warn("[VoiceChat] Audio Context error:", e);
-        }
-
-        return () => {
-            if (animationFrame) cancelAnimationFrame(animationFrame);
-            if (audioContext) audioContext.close();
-        };
-    }, [stream, onVolumeChange]);
-
-    return (
-        <audio
-            ref={audioRef}
-            autoPlay
-            playsInline
-            muted={isSpeakerMuted}
-            onError={(e) => console.error("Audio playback error", e)}
-        />
-    );
-};
-
+// --- WebSocket Audio Logic ---
+// We send MediaRecorder chunks -> Server -> Other Clients -> Decode -> Queue -> Play
 
 const VoiceChat = ({ room, isRoomJoined }) => {
-    const [peers, setPeers] = useState([]);
-    const [stream, setStream] = useState(null);
+    // UI State
     const [isVoiceJoined, setIsVoiceJoined] = useState(false);
-    const [isMicMuted, setIsMicMuted] = useState(true); // Default to muted
-    const [remotePeerStatus, setRemotePeerStatus] = useState({});
-    const peersRef = useRef([]);
+    const [isMicMuted, setIsMicMuted] = useState(true); // Default Muted
     const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
     const [isMinimized, setIsMinimized] = useState(false);
+    const [remotePeerStatus, setRemotePeerStatus] = useState({});
 
-    // Refs
+    // Active speakers tracking (for visualizer)
+    const [activeSpeakers, setActiveSpeakers] = useState(new Set());
+
+    // Refs for internals
+    const mediaRecorderRef = useRef(null);
+    const audioContextRef = useRef(null);
+    const streamRef = useRef(null);
     const panelRef = useRef(null);
-    const floatRef = useRef(null);
-    const streamRef = useRef(null); // Keep track of stream in ref for cleanup
 
-    // Click outside handler
-    useEffect(() => {
-        const handleClickOutside = (event) => {
-            if (isVoiceJoined && !isMinimized &&
-                panelRef.current && !panelRef.current.contains(event.target)) {
-                setIsMinimized(true);
-            }
-        };
-        document.addEventListener("mousedown", handleClickOutside);
-        return () => document.removeEventListener("mousedown", handleClickOutside);
-    }, [isVoiceJoined, isMinimized]);
+    // Playback Queue: Map<senderId, { nextTime: number, analyser: AnalyserNode }>
+    const audioPlayersRef = useRef(new Map());
 
-    // --- Actions ---
-    const joinVoice = () => {
-        if (!room) return;
-        console.log("[VoiceChat] Joining voice...");
-
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            alert("Voice Chat not supported/secure context needed.");
-            return;
+    // --- Audio Context Helper ---
+    const getAudioContext = () => {
+        if (!audioContextRef.current) {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioContextRef.current = new AudioContext();
         }
-
-        navigator.mediaDevices.getUserMedia({ video: false, audio: true })
-            .then(currentStream => {
-                console.log("[VoiceChat] Stream acquired");
-                // Mute by default
-                currentStream.getAudioTracks().forEach(track => track.enabled = false);
-
-                setStream(currentStream);
-                streamRef.current = currentStream;
-                setIsVoiceJoined(true);
-                setIsMinimized(false);
-
-                // Note: We need to broadcast strict initial state, but socket logic is in useEffect
-                // The useEffect will pick up the 'isMicMuted' state if we pass it or emit it?
-                // Currently socket.emit('join_voice') doesn't send status. 
-                // We should probably emit an initial status update or handle it in the effect.
-            })
-            .catch(err => {
-                console.error("[VoiceChat] Failed to get stream", err);
-                alert("Could not access microphone.");
-            });
+        // Always try resume if suspended
+        if (audioContextRef.current.state === 'suspended') {
+            audioContextRef.current.resume().catch(e => console.warn("AudioContext Resume failed", e));
+        }
+        return audioContextRef.current;
     };
 
-    // --- Socket & Peer Logic ---
-    useEffect(() => {
-        if (!isVoiceJoined || !stream || !room) return;
+    // --- Action: Join Voice ---
+    const joinVoice = async () => {
+        if (!room) return;
+        try {
+            console.log("[VoiceChat] Requesting mic access...");
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        console.log("[VoiceChat] Initializing socket listeners for room:", room);
-        console.log("[VoiceChat] Initializing socket listeners for room:", room);
-        socket.emit("join_voice", room);
-        // Immediately broadcast initial mute state
-        socket.emit("voice_status_update", { room, status: { isMicMuted: true } });
+            // Immediately Mute
+            stream.getAudioTracks().forEach(t => t.enabled = false);
+            setIsMicMuted(true);
 
-        // 1. Existing users in room
-        const handleAllUsers = (users) => {
-            console.log("[VoiceChat] existing users:", users);
-            // Cleanup old
-            peersRef.current.forEach(p => { try { p.peer.destroy(); } catch (e) { } });
-            peersRef.current = [];
+            streamRef.current = stream;
+            setIsVoiceJoined(true);
+            setIsMinimized(false);
 
-            const peersList = [];
-            users.forEach(userID => {
-                const peer = createPeer(userID, socket.id, stream);
-                peersRef.current.push({ peerID: userID, peer });
-                peersList.push({ peerID: userID, peer });
-            });
-            setPeers(peersList);
-        };
+            // Start Socket logic
+            socket.emit("join_voice", room);
+            socket.emit("voice_status_update", { room, status: { isMicMuted: true } });
 
-        // 2. New user joining (Incoming Call)
-        const handleUserJoined = (payload) => {
-            console.log("[VoiceChat] User joined (incoming signal):", payload.callerID);
+            // Start Recording Loop (we record silence if muted, which effectively sends nothing if we filter it, 
+            // but MediaRecorder sends data regardless if track is enabled but MUTED. 
+            // Wait, track.enabled=false means MediaRecorder receives silence. 
+            // Sending silence is waste of bandwidth. We can pause recorder when muted.)
+            startRecording(stream);
 
-            // Remove existing peer if any (deduplication)
-            const existingIdx = peersRef.current.findIndex(p => p.peerID === payload.callerID);
-            if (existingIdx !== -1) {
-                console.warn("[VoiceChat] Duplicate peer detected, replacing:", payload.callerID);
-                try { peersRef.current[existingIdx].peer.destroy(); } catch (e) { }
-                peersRef.current.splice(existingIdx, 1);
-            }
+        } catch (err) {
+            console.error("Mic Error:", err);
+            alert("Could not access microphone.");
+        }
+    };
 
-            const peer = addPeer(payload.signal, payload.callerID, stream);
-            peersRef.current.push({ peerID: payload.callerID, peer });
-
-            setPeers(prev => {
-                const filtered = prev.filter(p => p.peerID !== payload.callerID);
-                return [...filtered, { peerID: payload.callerID, peer }];
-            });
-        };
-
-        // 3. Receive signal response (Answer)
-        const handleReturningSignal = (payload) => {
-            console.log("[VoiceChat] Received returned signal from:", payload.id);
-            const item = peersRef.current.find(p => p.peerID === payload.id);
-            if (item) {
-                item.peer.signal(payload.signal);
-            }
-        };
-
-        // 4. User left
-        const handleUserLeft = (id) => {
-            console.log("[VoiceChat] User left:", id);
-            const peerObj = peersRef.current.find(p => p.peerID === id);
-            if (peerObj) peerObj.peer.destroy();
-            const newPeers = peersRef.current.filter(p => p.peerID !== id);
-            peersRef.current = newPeers;
-            setPeers(newPeers);
-            setRemotePeerStatus(prev => {
-                const next = { ...prev };
-                delete next[id];
-                return next;
-            });
-        };
-
-        const handleStatusUpdate = ({ id, status }) => {
-            setRemotePeerStatus(prev => ({ ...prev, [id]: status }));
-        };
-
-        socket.on("all_voice_users", handleAllUsers);
-        socket.on("user_joined_voice", handleUserJoined);
-        socket.on("receiving_returned_signal", handleReturningSignal);
-        socket.on("user_left_voice", handleUserLeft);
-        socket.on("voice_status_update", handleStatusUpdate);
-
-        return () => {
-            socket.off("all_voice_users", handleAllUsers);
-            socket.off("user_joined_voice", handleUserJoined);
-            socket.off("receiving_returned_signal", handleReturningSignal);
-            socket.off("user_left_voice", handleUserLeft);
-            socket.off("voice_status_update", handleStatusUpdate);
-        };
-    }, [isVoiceJoined, stream, room]);
-
-    const leaveVoice = () => {
-        // Stop all tracks
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach(track => track.stop());
-            setStream(null);
-            streamRef.current = null;
+    const startRecording = (stream) => {
+        // Use small timeslice for low latency
+        // 100ms is aggressive but good for voice. 250ms is safer for bad net.
+        // Let's go with 200ms.
+        // Mimetype: 'audio/webm;codecs=opus' is standard.
+        let options = { mimeType: 'audio/webm;codecs=opus' };
+        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+            options = {}; // Default
         }
 
-        // Notify server
+        const recorder = new MediaRecorder(stream, options);
+        mediaRecorderRef.current = recorder;
+
+        recorder.ondataavailable = async (e) => {
+            if (e.data.size > 0 && socket.connected && !isMicMuted) {
+                // Convert Blob to ArrayBuffer to send over socket efficiently
+                const buffer = await e.data.arrayBuffer();
+                socket.emit("voice_data", { room, data: buffer });
+
+                // Visualizer for self
+                if (activeSpeakers.has("me")) {
+                    // Timeout to un-highlight self is handled by volume check or manual ?
+                    // Actually, simple way to visualize self is checking volume of stream
+                }
+            }
+        };
+
+        recorder.start(150); // 150ms chunks
+    };
+
+    const leaveVoice = () => {
+        // Stop Recorder
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop();
+        }
+        // Stop Tracks
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(t => t.stop());
+            streamRef.current = null;
+        }
+        // Notify
         if (room && isVoiceJoined) {
             socket.emit("leave_voice", room);
         }
 
-        // Destroy all peers
-        if (peersRef.current) {
-            peersRef.current.forEach(p => {
-                if (p.peer) p.peer.destroy();
-            });
-            peersRef.current = [];
-        }
-        setPeers([]);
+        // Reset State
         setIsVoiceJoined(false);
-        setIsMicMuted(false);
-        setIsSpeakerMuted(false);
+        setIsMicMuted(true);
+        setActiveSpeakers(new Set());
         setRemotePeerStatus({});
-        setIsMinimized(false);
+        audioPlayersRef.current.clear();
 
-        // Note: Listeners are cleaned up by useEffect when isVoiceJoined becomes false
-    };
-
-    const ICE_CONFIG = {
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-            { urls: 'stun:stun3.l.google.com:19302' },
-            { urls: 'stun:stun4.l.google.com:19302' },
-        ]
-    };
-
-    const createPeer = (userToSignal, callerID, stream) => {
-        const peer = new Peer({
-            initiator: true,
-            trickle: false,
-            stream,
-            config: ICE_CONFIG
-        });
-
-        peer.on("signal", signal => {
-            socket.emit("sending_signal", { userToSignal, callerID, signal });
-        });
-
-        return peer;
-    };
-
-    const addPeer = (incomingSignal, callerID, stream) => {
-        const peer = new Peer({
-            initiator: false,
-            trickle: false,
-            stream,
-            config: ICE_CONFIG
-        });
-
-        peer.on("signal", signal => {
-            socket.emit("returning_signal", { signal, callerID });
-        });
-
-        peer.signal(incomingSignal);
-
-        return peer;
-    };
-
-    const resumeAudio = () => {
-        // Helper to force resume audio context if suspended (common in Chrome/Mobile)
-        // Creating and resuming a context on user gesture unlocks the audio subsystem
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        if (AudioContext) {
-            const ctx = new AudioContext();
-            if (ctx.state === 'suspended') {
-                ctx.resume().then(() => ctx.close());
-            } else {
-                ctx.close();
-            }
+        // Close Context (optional, but good cleanup)
+        if (audioContextRef.current) {
+            audioContextRef.current.close();
+            audioContextRef.current = null;
         }
     };
 
-    const toggleMic = () => {
-        resumeAudio();
-        if (stream) {
-            const audioTrack = stream.getAudioTracks()[0];
-            if (audioTrack) {
-                audioTrack.enabled = !audioTrack.enabled;
-                setIsMicMuted(!audioTrack.enabled);
-                // Broadcast status
-                socket.emit("voice_status_update", { room, status: { isMicMuted: !audioTrack.enabled } });
+    // --- Playback Logic ---
+    const handleReceiveVoiceData = async ({ senderId, data }) => {
+        if (isSpeakerMuted || !isVoiceJoined) return;
+
+        const ctx = getAudioContext();
+
+        try {
+            // Decode opus/webm chunk (async)
+            const audioBuffer = await ctx.decodeAudioData(data);
+
+            // Queueing Logic
+            let playerState = audioPlayersRef.current.get(senderId);
+            if (!playerState) {
+                // Create Analyser for Visualizer
+                const analyser = ctx.createAnalyser();
+                analyser.fftSize = 64;
+                analyser.connect(ctx.destination);
+
+                playerState = {
+                    nextTime: ctx.currentTime, // Start immediately (buffer willing)
+                    analyser
+                };
+                audioPlayersRef.current.set(senderId, playerState);
+
+                // Start polling volume for visualizer
+                pollVolume(senderId, analyser);
             }
+
+            // Schedule Playback
+            // If nextTime is in past, reset to now (we lagged out or first packet)
+            // Add a tiny buffer (30ms) to ensure smooth stitching if jitter is low
+            const now = ctx.currentTime;
+            if (playerState.nextTime < now) {
+                playerState.nextTime = now + 0.05; // 50ms startup buffer
+            }
+
+            const source = ctx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(playerState.analyser);
+
+            source.start(playerState.nextTime);
+
+            // Advance pointer
+            playerState.nextTime += audioBuffer.duration;
+
+        } catch (err) {
+            console.error("Audio Decode Error:", err);
+        }
+    };
+
+    // --- Visualizer Polling ---
+    const pollVolume = (id, analyser) => {
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        const check = () => {
+            if (!audioPlayersRef.current.has(id)) return; // Stopped
+
+            analyser.getByteFrequencyData(dataArray);
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+            const avg = sum / dataArray.length;
+
+            if (avg > 10) {
+                setActiveSpeakers(prev => new Set(prev).add(id));
+            } else {
+                setActiveSpeakers(prev => {
+                    if (!prev.has(id)) return prev;
+                    const next = new Set(prev);
+                    next.delete(id);
+                    return next;
+                });
+            }
+            requestAnimationFrame(check);
+        };
+        check();
+    };
+
+    // --- Self Visualizer ---
+    useEffect(() => {
+        if (!streamRef.current || isMicMuted || !isVoiceJoined) {
+            setActiveSpeakers(prev => {
+                const next = new Set(prev);
+                next.delete("me");
+                return next;
+            });
+            return;
+        }
+
+        const ctx = getAudioContext();
+        const info = { animation: null };
+        try {
+            const source = ctx.createMediaStreamSource(streamRef.current);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 64;
+            source.connect(analyser); // Don't connect to destination (feedback loop)
+
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            const check = () => {
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                const avg = sum / dataArray.length;
+
+                if (avg > 10) setActiveSpeakers(p => new Set(p).add("me"));
+                else setActiveSpeakers(p => { const n = new Set(p); n.delete("me"); return n; });
+
+                info.animation = requestAnimationFrame(check);
+            };
+            check();
+        } catch (e) { }
+
+        return () => cancelAnimationFrame(info.animation);
+    }, [isMicMuted, isVoiceJoined]);
+
+
+    // --- Socket Listeners ---
+    useEffect(() => {
+        if (!isVoiceJoined) return;
+
+        socket.on("receive_voice_data", handleReceiveVoiceData);
+
+        // Voice Status (Mute icons)
+        socket.on("voice_status_update", ({ id, status }) => {
+            setRemotePeerStatus(prev => ({ ...prev, [id]: status }));
+        });
+
+        // User Left Cleanup
+        socket.on("user_left_voice", (id) => {
+            audioPlayersRef.current.delete(id);
+            setActiveSpeakers(p => { const n = new Set(p); n.delete(id); return n; });
+            setRemotePeerStatus(p => {
+                const next = { ...p };
+                delete next[id];
+                return next;
+            });
+        });
+
+        return () => {
+            socket.off("receive_voice_data", handleReceiveVoiceData);
+            socket.off("voice_status_update");
+            socket.off("user_left_voice");
+        };
+    }, [isVoiceJoined, isSpeakerMuted]); // Re-bind if mute changes to stop processing? No, check in handler.
+
+    // --- Controls ---
+    const toggleMic = () => {
+        getAudioContext(); // Resume context
+        if (streamRef.current) {
+            const tracks = streamRef.current.getAudioTracks();
+            // We want to toggle the current state.
+            // If currently Muted (isMicMuted=true), we want enabled=true.
+            const shouldEnable = isMicMuted;
+
+            tracks.forEach(t => t.enabled = shouldEnable);
+
+            setIsMicMuted(!isMicMuted); // Update state to new value
+            socket.emit("voice_status_update", { room, status: { isMicMuted: !isMicMuted } });
         }
     };
 
     const toggleSpeaker = () => {
-        resumeAudio();
+        getAudioContext();
         setIsSpeakerMuted(!isSpeakerMuted);
     };
 
-    // --- Lifecycle ---
-    // Ensure we leave voice when the room ID changes (cleanup previous room)
+    // Auto-leave on unmount or room change
     useEffect(() => {
-        return () => {
-            leaveVoice();
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [room]);
-
-    // Reset when isRoomJoined becomes false
-    useEffect(() => {
-        if (!isRoomJoined) {
-            leaveVoice();
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        if (!isRoomJoined) leaveVoice();
     }, [isRoomJoined]);
 
-    // Reconnection Handler
     useEffect(() => {
-        const handleReconnect = () => {
-            if (isVoiceJoined && room) {
-                console.log("Reconnecting to voice...");
-                // Note: verify if we need to clear peers. 
-                // WebRTC connections might persist independent of socket.
-                // However, for discovery of new users or re-sync, re-joining is safe.
-                // If the server lost state, we NEED to re-join to be discoverable.
-                socket.emit("join_voice", room);
-            }
-        };
-
-        socket.on("connect", handleReconnect);
-        return () => socket.off("connect", handleReconnect);
-    }, [isVoiceJoined, room]);
-
-    const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
+        return () => leaveVoice();
+    }, []);
 
     // --- Render ---
-    // Only show if room is joined
-    if (!isRoomJoined) {
-        return null;
-    }
+    if (!isRoomJoined) return null;
+
+    const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
 
     return (
         <div className="fixed bottom-4 left-4 z-[9000] flex flex-col gap-2">
@@ -390,7 +314,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                     isMinimized ? (
                         <motion.button
                             key="minimized"
-                            ref={floatRef}
                             layoutId="voice-panel"
                             initial={{ scale: 0.8, opacity: 0 }}
                             animate={{
@@ -421,7 +344,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                             <div className="flex justify-between items-center mb-3 border-b border-white/10 pb-2">
                                 <div className="flex items-center gap-2 text-green-400">
                                     <Radio size={16} className="animate-pulse" />
-                                    <span className="font-bold text-xs uppercase tracking-wider">Voice Connected</span>
+                                    <span className="font-bold text-xs uppercase tracking-wider">Voice (WS)</span>
                                 </div>
                                 <div className="flex gap-2">
                                     <button onClick={() => setIsMinimized(true)} className="text-gray-400 hover:text-white transition-colors">
@@ -433,37 +356,30 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                                 </div>
                             </div>
 
-                            {/* Peers List */}
+                            {/* Participants List */}
                             <div className="space-y-2 mb-4 max-h-40 overflow-y-auto custom-scrollbar">
                                 {/* Me */}
                                 <div className="flex items-center justify-between p-2 rounded-lg bg-white/5 border border-white/5">
                                     <div className="flex items-center gap-2">
-                                        <div className={`w-2 h-2 rounded-full transition-all duration-300 ${!isMicMuted ? 'bg-green-500 shadow-[0_0_8px_green]' : 'bg-gray-600'}`} />
+                                        <div className={`w-2 h-2 rounded-full transition-all duration-200 ${activeSpeakers.has("me") ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-gray-600'}`} />
                                         <span className="text-xs font-bold text-gray-300">You</span>
                                     </div>
-                                    <div className="flex items-center gap-2">
-                                        {stream && <LocalActivityIndicator stream={stream} isMuted={isMicMuted} />}
-                                        {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
-                                    </div>
+                                    {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
                                 </div>
 
-                                {/* Others */}
-                                {peers.map((p, i) => {
-                                    const status = remotePeerStatus[p.peerID] || {};
-                                    return (
-                                        <div key={p.peerID} className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-2 h-2 rounded-full bg-blue-500 shadow-[0_0_8px_blue]" />
-                                                <span className="text-xs font-bold text-gray-400">Player {i + 1}</span>
-                                            </div>
-                                            <div className="flex items-center gap-2">
-                                                <AudioWrapper peer={p.peer} isSpeakerMuted={isSpeakerMuted} />
-                                                {status.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
-                                            </div>
+                                {/* Active Speakers (or just anyone sending data really, simplified as we don't track full user list in this simplified component, but we can infer from status updates or just rely on 'activeSpeakers' set logic if we want to be minimal. But better to reuse User list from props if available? No props. 
+                                We should track 'known' users via voice_status_update or receive_voice_data events to render list. 
+                                Let's assume we render users who sent data or status updates. */}
+                                {Object.keys(remotePeerStatus).map((id, i) => (
+                                    <div key={id} className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
+                                        <div className="flex items-center gap-2">
+                                            <div className={`w-2 h-2 rounded-full transition-all duration-200 ${activeSpeakers.has(id) ? 'bg-blue-400 scale-125 shadow-[0_0_8px_#3b82f6]' : 'bg-blue-900'}`} />
+                                            <span className="text-xs font-bold text-gray-400">Player {i + 1}</span>
                                         </div>
-                                    );
-                                })}
-                                {peers.length === 0 && (
+                                        {remotePeerStatus[id]?.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
+                                    </div>
+                                ))}
+                                {Object.keys(remotePeerStatus).length === 0 && (
                                     <div className="text-[10px] text-gray-500 text-center py-2">Waiting for others...</div>
                                 )}
                             </div>
@@ -516,71 +432,12 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                 >
                     <Phone size={24} className="group-hover:animate-bounce" />
                     <span className="absolute left-full ml-2 bg-black/80 text-white text-xs px-2 py-1 rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                        Join Voice
+                        Join Voice (WS)
                     </span>
                 </motion.button>
             )}
         </div>
     );
 };
-
-// Helper wrapper to extract stream from peer
-const AudioWrapper = ({ peer, isSpeakerMuted }) => {
-    const [stream, setStream] = useState(null);
-    const [avgVolume, setAvgVolume] = useState(0);
-
-    useEffect(() => {
-        peer.on("stream", currentStream => {
-            console.log("[VoiceChat] Received remote stream");
-            setStream(currentStream);
-        });
-    }, [peer]);
-
-    if (!stream) return null;
-
-    const isTalking = avgVolume > 10;
-
-    return (
-        <div className="flex items-center gap-2">
-            <div className={`w-1.5 h-1.5 rounded-full transition-all duration-200 ${isTalking ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-transparent'}`} />
-            <AudioPlayer stream={stream} isSpeakerMuted={isSpeakerMuted} onVolumeChange={setAvgVolume} />
-        </div>
-    );
-}
-
-const LocalActivityIndicator = ({ stream, isMuted }) => {
-    const [avgVolume, setAvgVolume] = useState(0);
-    // Reuse AudioPlayer logic without rendering audio element
-    useEffect(() => {
-        if (isMuted || !stream) {
-            setAvgVolume(0);
-            return;
-        }
-        let audioContext, analyser, source, animationFrame;
-        try {
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            analyser = audioContext.createAnalyser();
-            source = audioContext.createMediaStreamSource(stream);
-            source.connect(analyser);
-            analyser.fftSize = 64;
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-            const check = () => {
-                analyser.getByteFrequencyData(dataArray);
-                let sum = 0;
-                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-                setAvgVolume(sum / dataArray.length);
-                animationFrame = requestAnimationFrame(check);
-            };
-            check();
-        } catch (e) { }
-        return () => {
-            if (animationFrame) cancelAnimationFrame(animationFrame);
-            if (audioContext) audioContext.close();
-        };
-    }, [stream, isMuted]);
-
-    const isTalking = avgVolume > 10;
-    return <div className={`w-1.5 h-1.5 rounded-full transition-all duration-200 ${isTalking ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-transparent'}`} />;
-}
 
 export default VoiceChat;

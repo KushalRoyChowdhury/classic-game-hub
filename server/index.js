@@ -235,6 +235,12 @@ io.on("connection", (socket) => {
             socket.to(room).emit("voice_status_update", { id: socket.id, status });
         }
     });
+
+    // --- Audio Streaming over WebSocket ---
+    socket.on("voice_data", ({ room, data }) => {
+        // Relay binary audio chunks to others
+        socket.to(room).emit("receive_voice_data", { senderId: socket.id, data });
+    });
 });
 
 app.get("/health", (req, res) => {

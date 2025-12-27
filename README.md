@@ -38,7 +38,7 @@ Built with a "Neon Retro" aesthetic, glassmorphism UI, and smooth Framer Motion 
 - **🤖 Game Modes**:
   - **PvP (Local)**: Play on the same device.
   - **PvAI**: Challenge a smart AI bot (Tic-Tac-Toe & Snake & Ladders).
-  - **Online**: Create or join rooms to play with friends anywhere.
+  - **Online**: Create or join rooms to play with friends anywhere. (*Note: This mode does not use optimistic updates; actions are confirmed by the server to ensure fairness. High ping may cause slight delays. The default server is located in Singapore; average ping tested in India is ~50ms on WiFi. If you face high latency, try hosting the server locally.*)
 - **🎨 Premium UI/UX**:
   - **Glassmorphism Design**: Sleek, modern, transparent aesthetics.
   - **Dark Mode**: Optimized for comfortable gaming.

@@ -3,245 +3,210 @@ import socket from '../socket';
 import { Mic, MicOff, Volume2, VolumeX, X, Phone, Radio } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// --- WebSocket Audio Logic ---
-// We send MediaRecorder chunks -> Server -> Other Clients -> Decode -> Queue -> Play
+// --- constants ---
+const SAMPLE_RATE = 16000; // Standard for VoIP
+const BUFFER_SIZE = 4096; // ~250ms latency chunk
 
 const VoiceChat = ({ room, isRoomJoined }) => {
     // UI State
     const [isVoiceJoined, setIsVoiceJoined] = useState(false);
-    const [isMicMuted, setIsMicMuted] = useState(true); // Default Muted
+    const [isMicMuted, setIsMicMuted] = useState(true);
     const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
     const [isMinimized, setIsMinimized] = useState(false);
     const [remotePeerStatus, setRemotePeerStatus] = useState({});
-
-    // Active speakers tracking (for visualizer)
     const [activeSpeakers, setActiveSpeakers] = useState(new Set());
 
-    // Refs for internals
-    const mediaRecorderRef = useRef(null);
+    // Refs
     const audioContextRef = useRef(null);
+    const processorRef = useRef(null);
     const streamRef = useRef(null);
-    const panelRef = useRef(null);
+    const microphoneRef = useRef(null);
+    const activeSpeakersTimeoutRef = useRef({});
 
-    // Playback Queue: Map<senderId, { nextTime: number, analyser: AnalyserNode }>
-    const audioPlayersRef = useRef(new Map());
+    // Playback Timing
+    const nextPlayTimeRef = useRef(0);
 
     // --- Audio Context Helper ---
     const getAudioContext = () => {
         if (!audioContextRef.current) {
+            // Force 16k sample rate if possible to match our protocol, 
+            // but usually browser enforces hardware rate. We will resample manually.
             const AudioContext = window.AudioContext || window.webkitAudioContext;
-            audioContextRef.current = new AudioContext();
+            audioContextRef.current = new AudioContext(); // We'll deal with resampling in code
         }
-        // Always try resume if suspended
         if (audioContextRef.current.state === 'suspended') {
-            audioContextRef.current.resume().catch(e => console.warn("AudioContext Resume failed", e));
+            audioContextRef.current.resume().catch(() => { });
         }
         return audioContextRef.current;
     };
 
-    // --- Action: Join Voice ---
+    // --- Resampling Helper (Linear Interpolation) ---
+    const resample = (inputData, inputRate, outputRate) => {
+        if (inputRate === outputRate) return inputData;
+        const ratio = inputRate / outputRate;
+        const newLength = Math.round(inputData.length / ratio);
+        const result = new Float32Array(newLength);
+        for (let i = 0; i < newLength; i++) {
+            const originalIndex = i * ratio;
+            const index1 = Math.floor(originalIndex);
+            const index2 = Math.min(Math.ceil(originalIndex), inputData.length - 1);
+            const weight = originalIndex - index1;
+            result[i] = inputData[index1] * (1 - weight) + inputData[index2] * weight;
+        }
+        return result;
+    };
+
+    // --- Encode/Decode Helpers ---
+    const floatTo16BitPCM = (float32Array) => {
+        const buffer = new ArrayBuffer(float32Array.length * 2);
+        const view = new DataView(buffer);
+        for (let i = 0; i < float32Array.length; i++) {
+            let s = Math.max(-1, Math.min(1, float32Array[i]));
+            view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+        return buffer;
+    };
+
+    const pcm16ToFloat = (buffer) => {
+        const view = new DataView(buffer);
+        const float32 = new Float32Array(buffer.byteLength / 2);
+        for (let i = 0; i < float32.length; i++) {
+            const int16 = view.getInt16(i * 2, true);
+            float32[i] = int16 < 0 ? int16 / 0x8000 : int16 / 0x7FFF;
+        }
+        return float32;
+    };
+
+    // --- Join Voice ---
     const joinVoice = async () => {
         if (!room) return;
         try {
-            console.log("[VoiceChat] Requesting mic access...");
+            console.log("[VoiceChat] Requesting mic (PCM)...");
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-            // Immediately Mute
-            stream.getAudioTracks().forEach(t => t.enabled = false);
-            setIsMicMuted(true);
-
             streamRef.current = stream;
+
+            setIsMicMuted(true); // Default mute
             setIsVoiceJoined(true);
             setIsMinimized(false);
 
-            // Start Socket logic
+            // Notify Server
             socket.emit("join_voice", room);
             socket.emit("voice_status_update", { room, status: { isMicMuted: true } });
 
-            // Start Recording Loop (we record silence if muted, which effectively sends nothing if we filter it, 
-            // but MediaRecorder sends data regardless if track is enabled but MUTED. 
-            // Wait, track.enabled=false means MediaRecorder receives silence. 
-            // Sending silence is waste of bandwidth. We can pause recorder when muted.)
-            startRecording(stream);
+            // Init Audio Processing
+            const ctx = getAudioContext();
+            const source = ctx.createMediaStreamSource(stream);
+            microphoneRef.current = source;
+
+            // ScriptProcessor (Deprecated but reliably lowest latency for manual PCM)
+            // Buffer size 4096 @ 44.1k = ~92ms
+            const processor = ctx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+            processorRef.current = processor;
+
+            processor.onaudioprocess = (e) => {
+                if (!socket.connected || isMicMuted) return;
+
+                const inputData = e.inputBuffer.getChannelData(0);
+
+                // 1. Resample to 16kHz to save bandwidth
+                const downsampled = resample(inputData, ctx.sampleRate, SAMPLE_RATE);
+
+                // 2. Convert to PCM16
+                const pcmData = floatTo16BitPCM(downsampled);
+
+                // 3. Send
+                socket.emit("voice_data", { room, data: pcmData });
+
+                // Self Visualizer (Volume Check)
+                let sum = 0;
+                for (let i = 0; i < inputData.length; i += 10) sum += Math.abs(inputData[i]);
+                const avg = sum / (inputData.length / 10);
+                if (avg > 0.05) updateActiveSpeaker("me");
+            };
+
+            // Chain: Mic -> Processor -> Destination (to keep it alive, but mute output to avoid feedback)
+            // Wait, processor -> destination will play yourself?
+            // "If the input buffer is not connected to any output, the audiocallback will not be called."
+            // We connect to destination but we set volume to 0? Or just don't handle output buffer.
+            source.connect(processor);
+            processor.connect(ctx.destination);
+            // WARNING: connecting to destination might cause self-echo if we copy input to output.
+            // By default `onaudioprocess` outputBuffer is silent? No, we must ensure we don't copy input to output.
+            // We are NOT copying inputData to e.outputBuffer. So it should be silent.
 
         } catch (err) {
-            console.error("Mic Error:", err);
-            alert("Could not access microphone.");
+            console.error(err);
+            alert("Mic Access Denied");
         }
     };
 
-    const startRecording = (stream) => {
-        // Use small timeslice for low latency
-        // 100ms is aggressive but good for voice. 250ms is safer for bad net.
-        // Let's go with 200ms.
-        // Mimetype: 'audio/webm;codecs=opus' is standard.
-        let options = { mimeType: 'audio/webm;codecs=opus' };
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            options = {}; // Default
-        }
-
-        const recorder = new MediaRecorder(stream, options);
-        mediaRecorderRef.current = recorder;
-
-        recorder.ondataavailable = async (e) => {
-            if (e.data.size > 0 && socket.connected && !isMicMuted) {
-                // Convert Blob to ArrayBuffer to send over socket efficiently
-                const buffer = await e.data.arrayBuffer();
-                socket.emit("voice_data", { room, data: buffer });
-
-                // Visualizer for self
-                if (activeSpeakers.has("me")) {
-                    // Timeout to un-highlight self is handled by volume check or manual ?
-                    // Actually, simple way to visualize self is checking volume of stream
-                }
-            }
-        };
-
-        recorder.start(150); // 150ms chunks
-    };
-
+    // --- Leave Voice ---
     const leaveVoice = () => {
-        // Stop Recorder
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-            mediaRecorderRef.current.stop();
+        if (processorRef.current) {
+            processorRef.current.disconnect();
+            processorRef.current.onaudioprocess = null;
         }
-        // Stop Tracks
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach(t => t.stop());
-            streamRef.current = null;
-        }
-        // Notify
-        if (room && isVoiceJoined) {
-            socket.emit("leave_voice", room);
-        }
+        if (microphoneRef.current) microphoneRef.current.disconnect();
+        if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
 
-        // Reset State
+        // Don't close context, reuse it.
+
+        socket.emit("leave_voice", room);
+
         setIsVoiceJoined(false);
         setIsMicMuted(true);
         setActiveSpeakers(new Set());
         setRemotePeerStatus({});
-        audioPlayersRef.current.clear();
-
-        // Close Context (optional, but good cleanup)
-        if (audioContextRef.current) {
-            audioContextRef.current.close();
-            audioContextRef.current = null;
-        }
+        nextPlayTimeRef.current = 0;
     };
 
-    // --- Playback Logic ---
+    // --- Receive Audio ---
     const handleReceiveVoiceData = async ({ senderId, data }) => {
         if (isSpeakerMuted || !isVoiceJoined) return;
 
         const ctx = getAudioContext();
 
-        try {
-            // Decode opus/webm chunk (async)
-            const audioBuffer = await ctx.decodeAudioData(data);
+        // 1. Decode Int16 -> Float32
+        const floatData = pcm16ToFloat(data); // These are 16kHz samples
 
-            // Queueing Logic
-            let playerState = audioPlayersRef.current.get(senderId);
-            if (!playerState) {
-                // Create Analyser for Visualizer
-                const analyser = ctx.createAnalyser();
-                analyser.fftSize = 64;
-                analyser.connect(ctx.destination);
+        // 2. Playback
+        // Create a buffer at 16kHz
+        const buffer = ctx.createBuffer(1, floatData.length, SAMPLE_RATE);
+        buffer.copyToChannel(floatData, 0);
 
-                playerState = {
-                    nextTime: ctx.currentTime, // Start immediately (buffer willing)
-                    analyser
-                };
-                audioPlayersRef.current.set(senderId, playerState);
+        // 3. Schedule
+        const node = ctx.createBufferSource();
+        node.buffer = buffer;
+        node.connect(ctx.destination);
 
-                // Start polling volume for visualizer
-                pollVolume(senderId, analyser);
-            }
-
-            // Schedule Playback
-            // If nextTime is in past, reset to now (we lagged out or first packet)
-            // Add a tiny buffer (30ms) to ensure smooth stitching if jitter is low
-            const now = ctx.currentTime;
-            if (playerState.nextTime < now) {
-                playerState.nextTime = now + 0.05; // 50ms startup buffer
-            }
-
-            const source = ctx.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(playerState.analyser);
-
-            source.start(playerState.nextTime);
-
-            // Advance pointer
-            playerState.nextTime += audioBuffer.duration;
-
-        } catch (err) {
-            console.error("Audio Decode Error:", err);
+        // Time Sync
+        const now = ctx.currentTime;
+        if (nextPlayTimeRef.current < now) {
+            nextPlayTimeRef.current = now + 0.05; // 50ms buffer
         }
+
+        node.start(nextPlayTimeRef.current);
+        nextPlayTimeRef.current += buffer.duration;
+
+        // Visualizer
+        let sum = 0;
+        for (let i = 0; i < floatData.length; i += 10) sum += Math.abs(floatData[i]);
+        const avg = sum / (floatData.length / 10);
+        if (avg > 0.05) updateActiveSpeaker(senderId);
     };
 
-    // --- Visualizer Polling ---
-    const pollVolume = (id, analyser) => {
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        const check = () => {
-            if (!audioPlayersRef.current.has(id)) return; // Stopped
-
-            analyser.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-            const avg = sum / dataArray.length;
-
-            if (avg > 10) {
-                setActiveSpeakers(prev => new Set(prev).add(id));
-            } else {
-                setActiveSpeakers(prev => {
-                    if (!prev.has(id)) return prev;
-                    const next = new Set(prev);
-                    next.delete(id);
-                    return next;
-                });
-            }
-            requestAnimationFrame(check);
-        };
-        check();
-    };
-
-    // --- Self Visualizer ---
-    useEffect(() => {
-        if (!streamRef.current || isMicMuted || !isVoiceJoined) {
+    // --- Active Speaker Helper ---
+    const updateActiveSpeaker = (id) => {
+        setActiveSpeakers(prev => new Set(prev).add(id));
+        if (activeSpeakersTimeoutRef.current[id]) clearTimeout(activeSpeakersTimeoutRef.current[id]);
+        activeSpeakersTimeoutRef.current[id] = setTimeout(() => {
             setActiveSpeakers(prev => {
                 const next = new Set(prev);
-                next.delete("me");
+                next.delete(id);
                 return next;
             });
-            return;
-        }
-
-        const ctx = getAudioContext();
-        const info = { animation: null };
-        try {
-            const source = ctx.createMediaStreamSource(streamRef.current);
-            const analyser = ctx.createAnalyser();
-            analyser.fftSize = 64;
-            source.connect(analyser); // Don't connect to destination (feedback loop)
-
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-            const check = () => {
-                analyser.getByteFrequencyData(dataArray);
-                let sum = 0;
-                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-                const avg = sum / dataArray.length;
-
-                if (avg > 10) setActiveSpeakers(p => new Set(p).add("me"));
-                else setActiveSpeakers(p => { const n = new Set(p); n.delete("me"); return n; });
-
-                info.animation = requestAnimationFrame(check);
-            };
-            check();
-        } catch (e) { }
-
-        return () => cancelAnimationFrame(info.animation);
-    }, [isMicMuted, isVoiceJoined]);
-
+        }, 300); // Highlight lasts 300ms
+    };
 
     // --- Socket Listeners ---
     useEffect(() => {
@@ -249,72 +214,56 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
         socket.on("receive_voice_data", handleReceiveVoiceData);
 
-        // Initial User List (for UI visibility)
         socket.on("all_voice_users", (users) => {
-            console.log("[VoiceChat] Existing users:", users);
             setRemotePeerStatus(prev => {
                 const next = { ...prev };
-                users.forEach(id => {
-                    if (!next[id]) next[id] = { isMicMuted: true }; // Assume muted initially or until update
-                });
+                users.forEach(id => { if (!next[id]) next[id] = { isMicMuted: true }; });
                 return next;
             });
         });
 
-        // Voice Status (Mute icons)
         socket.on("voice_status_update", ({ id, status }) => {
             setRemotePeerStatus(prev => ({ ...prev, [id]: status }));
         });
 
-        // User Left Cleanup
         socket.on("user_left_voice", (id) => {
-            audioPlayersRef.current.delete(id);
-            setActiveSpeakers(p => { const n = new Set(p); n.delete(id); return n; });
-            setRemotePeerStatus(p => {
-                const next = { ...p };
-                delete next[id];
-                return next;
-            });
+            setActiveSpeakers(prev => { const n = new Set(prev); n.delete(id); return n; });
+            setRemotePeerStatus(prev => { const n = new Set(prev); delete n[id]; return n; });
         });
 
         return () => {
             socket.off("receive_voice_data", handleReceiveVoiceData);
+            socket.off("all_voice_users");
             socket.off("voice_status_update");
             socket.off("user_left_voice");
         };
-    }, [isVoiceJoined, isSpeakerMuted]); // Re-bind if mute changes to stop processing? No, check in handler.
+    }, [isVoiceJoined, isSpeakerMuted]);
 
     // --- Controls ---
     const toggleMic = () => {
-        getAudioContext(); // Resume context
-        if (streamRef.current) {
-            const tracks = streamRef.current.getAudioTracks();
-            // We want to toggle the current state.
-            // If currently Muted (isMicMuted=true), we want enabled=true.
-            const shouldEnable = isMicMuted;
+        // IMPORTANT: In this PCM logic, we toggle 'isMicMuted' state mainly.
+        // 'onaudioprocess' checks this state.
+        // We do not need to enable/disable tracks because the ScriptProcessor is always running.
+        // Disabling tracks might stop the onaudioprocess callback in some browsers.
+        // So we just gate the data sending.
 
-            tracks.forEach(t => t.enabled = shouldEnable);
+        const newState = !isMicMuted;
+        setIsMicMuted(newState);
+        socket.emit("voice_status_update", { room, status: { isMicMuted: newState } });
 
-            setIsMicMuted(!isMicMuted); // Update state to new value
-            socket.emit("voice_status_update", { room, status: { isMicMuted: !isMicMuted } });
-        }
+        getAudioContext(); // Ensure awake
     };
 
     const toggleSpeaker = () => {
-        getAudioContext();
         setIsSpeakerMuted(!isSpeakerMuted);
+        getAudioContext();
     };
 
-    // Auto-leave on unmount or room change
-    useEffect(() => {
-        if (!isRoomJoined) leaveVoice();
-    }, [isRoomJoined]);
+    // Auto cleanup
+    useEffect(() => () => leaveVoice(), []);
+    useEffect(() => { if (!isRoomJoined) leaveVoice(); }, [isRoomJoined]);
 
-    useEffect(() => {
-        return () => leaveVoice();
-    }, []);
-
-    // --- Render ---
+    // --- UI Render ---
     if (!isRoomJoined) return null;
 
     const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
@@ -324,128 +273,60 @@ const VoiceChat = ({ room, isRoomJoined }) => {
             <AnimatePresence mode="wait">
                 {isVoiceJoined && (
                     isMinimized ? (
-                        <motion.button
-                            key="minimized"
-                            layoutId="voice-panel"
-                            initial={{ scale: 0.8, opacity: 0 }}
-                            animate={{
-                                scale: 1,
-                                opacity: 1,
-                                backgroundColor: isMicMuted ? "rgba(239, 68, 68, 0.2)" : "rgba(34, 197, 94, 0.2)",
-                                borderColor: isMicMuted ? "rgb(239, 68, 68)" : "rgb(34, 197, 94)",
-                                color: isMicMuted ? "rgb(248, 113, 113)" : "rgb(74, 222, 128)"
-                            }}
-                            exit={{ scale: 0.8, opacity: 0 }}
-                            transition={SPRING_TRANSITION}
-                            onClick={() => setIsMinimized(false)}
-                            className="p-3 rounded-full shadow-lg border-2 backdrop-blur-md flex items-center justify-center"
-                        >
-                            {isMicMuted ? <MicOff size={24} /> : <Mic size={24} />}
+                        <motion.button key="min" layoutId="voice-panel" onClick={() => setIsMinimized(false)}
+                            className="p-3 rounded-full shadow-lg border-2 backdrop-blur-md flex items-center justify-center bg-black/50 border-green-500/50">
+                            {isMicMuted ? <MicOff size={24} className="text-red-400" /> : <Mic size={24} className="text-green-400" />}
                         </motion.button>
                     ) : (
-                        <motion.div
-                            key="expanded"
-                            ref={panelRef}
-                            layoutId="voice-panel"
-                            initial={{ opacity: 0, scale: 0.9, y: 50 }}
-                            animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.9, y: 50 }}
-                            transition={SPRING_TRANSITION}
-                            className="bg-[#1a1a1a]/90 backdrop-blur-xl border border-white/10 p-4 rounded-2xl shadow-2xl w-64"
-                        >
+                        <motion.div key="exp" layoutId="voice-panel" className="bg-[#1a1a1a]/95 backdrop-blur-xl border border-white/10 p-4 rounded-2xl shadow-2xl w-64">
                             <div className="flex justify-between items-center mb-3 border-b border-white/10 pb-2">
-                                <div className="flex items-center gap-2 text-green-400">
-                                    <Radio size={16} className="animate-pulse" />
-                                    <span className="font-bold text-xs uppercase tracking-wider">Voice (WS)</span>
-                                </div>
+                                <span className="font-bold text-xs uppercase tracking-wider text-green-400 flex items-center gap-2">
+                                    <Radio size={12} className="animate-pulse" /> Voice (PCM)
+                                </span>
                                 <div className="flex gap-2">
-                                    <button onClick={() => setIsMinimized(true)} className="text-gray-400 hover:text-white transition-colors">
-                                        <X size={16} />
-                                    </button>
-                                    <button onClick={leaveVoice} className="text-red-400 hover:text-white transition-colors">
-                                        <Phone size={16} className="rotate-[135deg]" />
-                                    </button>
+                                    <button onClick={() => setIsMinimized(true)}><X size={16} className="text-gray-400" /></button>
+                                    <button onClick={leaveVoice}><Phone size={16} className="text-red-400 rotate-[135deg]" /></button>
                                 </div>
                             </div>
 
-                            {/* Participants List */}
                             <div className="space-y-2 mb-4 max-h-40 overflow-y-auto custom-scrollbar">
                                 {/* Me */}
                                 <div className="flex items-center justify-between p-2 rounded-lg bg-white/5 border border-white/5">
                                     <div className="flex items-center gap-2">
-                                        <div className={`w-2 h-2 rounded-full transition-all duration-200 ${activeSpeakers.has("me") ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-gray-600'}`} />
+                                        <div className={`w-2 h-2 rounded-full transition-all duration-100 ${activeSpeakers.has("me") ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-gray-600'}`} />
                                         <span className="text-xs font-bold text-gray-300">You</span>
                                     </div>
                                     {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
                                 </div>
-
-                                {/* Active Speakers (or just anyone sending data really, simplified as we don't track full user list in this simplified component, but we can infer from status updates or just rely on 'activeSpeakers' set logic if we want to be minimal. But better to reuse User list from props if available? No props. 
-                                We should track 'known' users via voice_status_update or receive_voice_data events to render list. 
-                                Let's assume we render users who sent data or status updates. */}
+                                {/* Others */}
                                 {Object.keys(remotePeerStatus).map((id, i) => (
                                     <div key={id} className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
                                         <div className="flex items-center gap-2">
-                                            <div className={`w-2 h-2 rounded-full transition-all duration-200 ${activeSpeakers.has(id) ? 'bg-blue-400 scale-125 shadow-[0_0_8px_#3b82f6]' : 'bg-blue-900'}`} />
+                                            <div className={`w-2 h-2 rounded-full transition-all duration-100 ${activeSpeakers.has(id) ? 'bg-blue-400 scale-125 shadow-[0_0_8px_#3b82f6]' : 'bg-blue-900'}`} />
                                             <span className="text-xs font-bold text-gray-400">Player {i + 1}</span>
                                         </div>
                                         {remotePeerStatus[id]?.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
                                     </div>
                                 ))}
-                                {Object.keys(remotePeerStatus).length === 0 && (
-                                    <div className="text-[10px] text-gray-500 text-center py-2">Waiting for others...</div>
-                                )}
                             </div>
 
-                            {/* Controls */}
                             <div className="grid grid-cols-2 gap-2">
-                                <motion.button
-                                    onClick={toggleMic}
-                                    animate={{
-                                        backgroundColor: isMicMuted ? "rgba(239, 68, 68, 0.2)" : "rgba(255, 255, 255, 0.1)",
-                                        color: isMicMuted ? "rgb(252, 165, 165)" : "rgb(255, 255, 255)"
-                                    }}
-                                    whileHover={{
-                                        backgroundColor: isMicMuted ? "rgba(239, 68, 68, 0.3)" : "rgba(255, 255, 255, 0.2)"
-                                    }}
-                                    whileTap={{ scale: 0.95 }}
-                                    className="p-2 rounded-lg flex items-center justify-center gap-2"
-                                >
-                                    {isMicMuted ? <MicOff size={16} /> : <Mic size={16} />}
-                                    <span className="text-[10px] font-bold">{isMicMuted ? 'Unmute' : 'Mute'}</span>
-                                </motion.button>
-                                <motion.button
-                                    onClick={toggleSpeaker}
-                                    animate={{
-                                        backgroundColor: isSpeakerMuted ? "rgba(239, 68, 68, 0.2)" : "rgba(255, 255, 255, 0.1)",
-                                        color: isSpeakerMuted ? "rgb(252, 165, 165)" : "rgb(255, 255, 255)"
-                                    }}
-                                    whileHover={{
-                                        backgroundColor: isSpeakerMuted ? "rgba(239, 68, 68, 0.3)" : "rgba(255, 255, 255, 0.2)"
-                                    }}
-                                    whileTap={{ scale: 0.95 }}
-                                    className="p-2 rounded-lg flex items-center justify-center gap-2"
-                                >
-                                    {isSpeakerMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
-                                    <span className="text-[10px] font-bold">{isSpeakerMuted ? 'Deafen' : 'Speaker'}</span>
-                                </motion.button>
+                                <button onClick={toggleMic} className={`p-2 rounded-lg flex items-center justify-center gap-2 transition-colors ${isMicMuted ? 'bg-red-500/20 text-red-300' : 'bg-white/10 text-white'}`}>
+                                    {isMicMuted ? <MicOff size={16} /> : <Mic size={16} />} <span className="text-[10px] font-bold">{isMicMuted ? 'Unmute' : 'Mute'}</span>
+                                </button>
+                                <button onClick={toggleSpeaker} className={`p-2 rounded-lg flex items-center justify-center gap-2 transition-colors ${isSpeakerMuted ? 'bg-red-500/20 text-red-300' : 'bg-white/10 text-white'}`}>
+                                    {isSpeakerMuted ? <VolumeX size={16} /> : <Volume2 size={16} />} <span className="text-[10px] font-bold">{isSpeakerMuted ? 'Deafen' : 'Speaker'}</span>
+                                </button>
                             </div>
-
                         </motion.div>
                     )
                 )}
             </AnimatePresence>
-
-            {!isVoiceJoined && (
-                <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={joinVoice}
-                    className="bg-green-600/90 text-white p-3 rounded-full shadow-lg border-2 border-green-400/30 backdrop-blur-sm flex items-center justify-center group"
-                >
-                    <Phone size={24} className="group-hover:animate-bounce" />
-                    <span className="absolute left-full ml-2 bg-black/80 text-white text-xs px-2 py-1 rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                        Join Voice (WS)
-                    </span>
+            {!isVoiceJoined && isRoomJoined && (
+                <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={joinVoice}
+                    className="bg-green-600/90 text-white p-3 rounded-full shadow-lg border-2 border-green-400/30 backdrop-blur-sm flex items-center justify-center">
+                    <Phone size={24} />
+                    <span className="sr-only">Join Voice</span>
                 </motion.button>
             )}
         </div>

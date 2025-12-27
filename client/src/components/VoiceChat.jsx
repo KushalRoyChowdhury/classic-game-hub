@@ -5,21 +5,56 @@ import { Mic, MicOff, Volume2, VolumeX, X, Phone, Users, Radio } from 'lucide-re
 import { motion, AnimatePresence } from 'framer-motion';
 
 // Separate component for rendering audio allows for better react lifecycle management of streams
-const AudioPlayer = ({ stream, isSpeakerMuted }) => {
+const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
     const audioRef = useRef();
 
     useEffect(() => {
         if (audioRef.current && stream) {
             audioRef.current.srcObject = stream;
+            // Force play for mobile browsers
+            audioRef.current.play().catch(e => console.log("[VoiceChat] Playback blocked or failed:", e));
         }
-    }, [stream]);
+
+        // Voice activity detection
+        let audioContext;
+        let analyser;
+        let source;
+        let animationFrame;
+
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            source = audioContext.createMediaStreamSource(stream);
+            source.connect(analyser);
+            analyser.fftSize = 64;
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+
+            const checkVolume = () => {
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+                const avg = sum / bufferLength;
+                if (onVolumeChange) onVolumeChange(avg);
+                animationFrame = requestAnimationFrame(checkVolume);
+            };
+            checkVolume();
+        } catch (e) {
+            console.warn("[VoiceChat] Audio Context error:", e);
+        }
+
+        return () => {
+            if (animationFrame) cancelAnimationFrame(animationFrame);
+            if (audioContext) audioContext.close();
+        };
+    }, [stream, onVolumeChange]);
 
     return (
         <audio
             ref={audioRef}
             autoPlay
             playsInline
-            muted={isSpeakerMuted} // Controlled by local speaker mute
+            muted={isSpeakerMuted}
             onError={(e) => console.error("Audio playback error", e)}
         />
     );
@@ -199,11 +234,22 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         // Note: Listeners are cleaned up by useEffect when isVoiceJoined becomes false
     };
 
+    const ICE_CONFIG = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
+        ]
+    };
+
     const createPeer = (userToSignal, callerID, stream) => {
         const peer = new Peer({
             initiator: true,
             trickle: false,
             stream,
+            config: ICE_CONFIG
         });
 
         peer.on("signal", signal => {
@@ -218,6 +264,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
             initiator: false,
             trickle: false,
             stream,
+            config: ICE_CONFIG
         });
 
         peer.on("signal", signal => {
@@ -338,14 +385,17 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                             </div>
 
                             {/* Peers List */}
-                            <div className="space-y-2 mb-4 max-h-40 overflow-y-auto">
+                            <div className="space-y-2 mb-4 max-h-40 overflow-y-auto custom-scrollbar">
                                 {/* Me */}
-                                <div className="flex items-center justify-between p-2 rounded-lg bg-white/5">
+                                <div className="flex items-center justify-between p-2 rounded-lg bg-white/5 border border-white/5">
                                     <div className="flex items-center gap-2">
-                                        <div className="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_8px_green]" />
+                                        <div className={`w-2 h-2 rounded-full transition-all duration-300 ${!isMicMuted ? 'bg-green-500 shadow-[0_0_8px_green]' : 'bg-gray-600'}`} />
                                         <span className="text-xs font-bold text-gray-300">You</span>
                                     </div>
-                                    {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
+                                    <div className="flex items-center gap-2">
+                                        {stream && <LocalActivityIndicator stream={stream} isMuted={isMicMuted} />}
+                                        {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
+                                    </div>
                                 </div>
 
                                 {/* Others */}
@@ -358,10 +408,8 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                                                 <span className="text-xs font-bold text-gray-400">Player {i + 1}</span>
                                             </div>
                                             <div className="flex items-center gap-2">
-                                                {/* If they muted themselves */}
-                                                {status.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
-                                                {/* Audio Element */}
                                                 <AudioWrapper peer={p.peer} isSpeakerMuted={isSpeakerMuted} />
+                                                {status.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
                                             </div>
                                         </div>
                                     );
@@ -430,16 +478,60 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 // Helper wrapper to extract stream from peer
 const AudioWrapper = ({ peer, isSpeakerMuted }) => {
     const [stream, setStream] = useState(null);
+    const [avgVolume, setAvgVolume] = useState(0);
 
     useEffect(() => {
         peer.on("stream", currentStream => {
+            console.log("[VoiceChat] Received remote stream");
             setStream(currentStream);
         });
     }, [peer]);
 
     if (!stream) return null;
 
-    return <AudioPlayer stream={stream} isSpeakerMuted={isSpeakerMuted} />;
+    const isTalking = avgVolume > 10;
+
+    return (
+        <div className="flex items-center gap-2">
+            <div className={`w-1.5 h-1.5 rounded-full transition-all duration-200 ${isTalking ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-transparent'}`} />
+            <AudioPlayer stream={stream} isSpeakerMuted={isSpeakerMuted} onVolumeChange={setAvgVolume} />
+        </div>
+    );
+}
+
+const LocalActivityIndicator = ({ stream, isMuted }) => {
+    const [avgVolume, setAvgVolume] = useState(0);
+    // Reuse AudioPlayer logic without rendering audio element
+    useEffect(() => {
+        if (isMuted || !stream) {
+            setAvgVolume(0);
+            return;
+        }
+        let audioContext, analyser, source, animationFrame;
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            source = audioContext.createMediaStreamSource(stream);
+            source.connect(analyser);
+            analyser.fftSize = 64;
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            const check = () => {
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                setAvgVolume(sum / dataArray.length);
+                animationFrame = requestAnimationFrame(check);
+            };
+            check();
+        } catch (e) { }
+        return () => {
+            if (animationFrame) cancelAnimationFrame(animationFrame);
+            if (audioContext) audioContext.close();
+        };
+    }, [stream, isMuted]);
+
+    const isTalking = avgVolume > 10;
+    return <div className={`w-1.5 h-1.5 rounded-full transition-all duration-200 ${isTalking ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-transparent'}`} />;
 }
 
 export default VoiceChat;

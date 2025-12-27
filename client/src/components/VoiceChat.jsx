@@ -24,6 +24,12 @@ const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
         try {
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
             analyser = audioContext.createAnalyser();
+
+            // Wait for context to be running
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+
             source = audioContext.createMediaStreamSource(stream);
             source.connect(analyser);
             analyser.fftSize = 64;
@@ -31,6 +37,11 @@ const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
             const dataArray = new Uint8Array(bufferLength);
 
             const checkVolume = () => {
+                // Persistent resume attempt
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume().catch(e => { });
+                }
+
                 analyser.getByteFrequencyData(dataArray);
                 let sum = 0;
                 for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
@@ -39,6 +50,8 @@ const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
                 animationFrame = requestAnimationFrame(checkVolume);
             };
             checkVolume();
+
+            console.log("[AudioPlayer] Initialized for track:", stream.getAudioTracks()[0]?.label);
         } catch (e) {
             console.warn("[VoiceChat] Audio Context error:", e);
         }
@@ -70,7 +83,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
     const [peers, setPeers] = useState([]);
     const [stream, setStream] = useState(null);
     const [isVoiceJoined, setIsVoiceJoined] = useState(false);
-    const [isMicMuted, setIsMicMuted] = useState(false);
+    const [isMicMuted, setIsMicMuted] = useState(true); // Default to muted
     const [remotePeerStatus, setRemotePeerStatus] = useState({});
     const peersRef = useRef([]);
     const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
@@ -106,10 +119,18 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         navigator.mediaDevices.getUserMedia({ video: false, audio: true })
             .then(currentStream => {
                 console.log("[VoiceChat] Stream acquired");
+                // Mute by default
+                currentStream.getAudioTracks().forEach(track => track.enabled = false);
+
                 setStream(currentStream);
                 streamRef.current = currentStream;
                 setIsVoiceJoined(true);
                 setIsMinimized(false);
+
+                // Note: We need to broadcast strict initial state, but socket logic is in useEffect
+                // The useEffect will pick up the 'isMicMuted' state if we pass it or emit it?
+                // Currently socket.emit('join_voice') doesn't send status. 
+                // We should probably emit an initial status update or handle it in the effect.
             })
             .catch(err => {
                 console.error("[VoiceChat] Failed to get stream", err);
@@ -122,7 +143,10 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         if (!isVoiceJoined || !stream || !room) return;
 
         console.log("[VoiceChat] Initializing socket listeners for room:", room);
+        console.log("[VoiceChat] Initializing socket listeners for room:", room);
         socket.emit("join_voice", room);
+        // Immediately broadcast initial mute state
+        socket.emit("voice_status_update", { room, status: { isMicMuted: true } });
 
         // 1. Existing users in room
         const handleAllUsers = (users) => {
@@ -276,7 +300,22 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         return peer;
     };
 
+    const resumeAudio = () => {
+        // Helper to force resume audio context if suspended (common in Chrome/Mobile)
+        // Creating and resuming a context on user gesture unlocks the audio subsystem
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) {
+            const ctx = new AudioContext();
+            if (ctx.state === 'suspended') {
+                ctx.resume().then(() => ctx.close());
+            } else {
+                ctx.close();
+            }
+        }
+    };
+
     const toggleMic = () => {
+        resumeAudio();
         if (stream) {
             const audioTrack = stream.getAudioTracks()[0];
             if (audioTrack) {
@@ -289,6 +328,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
     };
 
     const toggleSpeaker = () => {
+        resumeAudio();
         setIsSpeakerMuted(!isSpeakerMuted);
     };
 

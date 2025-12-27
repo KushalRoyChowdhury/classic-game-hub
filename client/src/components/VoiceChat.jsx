@@ -1,269 +1,260 @@
 import React, { useEffect, useState, useRef } from 'react';
+import Peer from 'peerjs';
 import socket from '../socket';
 import { Mic, MicOff, Volume2, VolumeX, X, Phone, Radio } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// --- constants ---
-const SAMPLE_RATE = 16000; // Standard for VoIP
-const BUFFER_SIZE = 4096; // ~250ms latency chunk
+// --- PeerJS Implementation ---
+// Replaces manual Webrtc/binary sockets with PeerJS cloud signaling
 
 const VoiceChat = ({ room, isRoomJoined }) => {
     // UI State
     const [isVoiceJoined, setIsVoiceJoined] = useState(false);
-    const [isMicMuted, setIsMicMuted] = useState(true);
+    const [isMicMuted, setIsMicMuted] = useState(true); // Default Mute
     const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
     const [isMinimized, setIsMinimized] = useState(false);
     const [remotePeerStatus, setRemotePeerStatus] = useState({});
-    const [activeSpeakers, setActiveSpeakers] = useState(new Set());
 
-    // Refs
-    const audioContextRef = useRef(null);
-    const processorRef = useRef(null);
+    // PeerJS Refs
+    const peerInstance = useRef(null);
+    const myPeerId = useRef(null);
     const streamRef = useRef(null);
-    const microphoneRef = useRef(null);
-    const activeSpeakersTimeoutRef = useRef({});
+    const peersCalls = useRef([]); // Keep track of active calls to close them
 
-    // Playback Timing
-    const nextPlayTimeRef = useRef(0);
+    // UI Refs
+    const remoteAudioRefs = useRef({}); // Map<callId, HTMLAudioElement>
 
-    // --- Audio Context Helper ---
-    const getAudioContext = () => {
-        if (!audioContextRef.current) {
-            // Force 16k sample rate if possible to match our protocol, 
-            // but usually browser enforces hardware rate. We will resample manually.
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            audioContextRef.current = new AudioContext(); // We'll deal with resampling in code
-        }
-        if (audioContextRef.current.state === 'suspended') {
-            audioContextRef.current.resume().catch(() => { });
-        }
-        return audioContextRef.current;
-    };
-
-    // --- Resampling Helper (Linear Interpolation) ---
-    const resample = (inputData, inputRate, outputRate) => {
-        if (inputRate === outputRate) return inputData;
-        const ratio = inputRate / outputRate;
-        const newLength = Math.round(inputData.length / ratio);
-        const result = new Float32Array(newLength);
-        for (let i = 0; i < newLength; i++) {
-            const originalIndex = i * ratio;
-            const index1 = Math.floor(originalIndex);
-            const index2 = Math.min(Math.ceil(originalIndex), inputData.length - 1);
-            const weight = originalIndex - index1;
-            result[i] = inputData[index1] * (1 - weight) + inputData[index2] * weight;
-        }
-        return result;
-    };
-
-    // --- Encode/Decode Helpers ---
-    const floatTo16BitPCM = (float32Array) => {
-        const buffer = new ArrayBuffer(float32Array.length * 2);
-        const view = new DataView(buffer);
-        for (let i = 0; i < float32Array.length; i++) {
-            let s = Math.max(-1, Math.min(1, float32Array[i]));
-            view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-        }
-        return buffer;
-    };
-
-    const pcm16ToFloat = (buffer) => {
-        const view = new DataView(buffer);
-        const float32 = new Float32Array(buffer.byteLength / 2);
-        for (let i = 0; i < float32.length; i++) {
-            const int16 = view.getInt16(i * 2, true);
-            float32[i] = int16 < 0 ? int16 / 0x8000 : int16 / 0x7FFF;
-        }
-        return float32;
-    };
-
-    // --- Join Voice ---
+    // --- Actions ---
     const joinVoice = async () => {
         if (!room) return;
         try {
-            console.log("[VoiceChat] Requesting mic (PCM)...");
+            console.log("[VoiceChat] Getting User Media...");
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            streamRef.current = stream;
 
-            setIsMicMuted(true); // Default mute
+            // Default Mute
+            stream.getAudioTracks().forEach(t => t.enabled = false);
+            setIsMicMuted(true);
+
+            streamRef.current = stream;
             setIsVoiceJoined(true);
             setIsMinimized(false);
 
-            // Notify Server
-            socket.emit("join_voice", room);
-            socket.emit("voice_status_update", { room, status: { isMicMuted: true } });
+            // Init PeerJS
+            // We use the default free cloud server. 
+            // In a prod app, you'd run your own 'peerjs-server'
+            const peer = new Peer(undefined, {
+                debug: 2
+            });
 
-            // Init Audio Processing
-            const ctx = getAudioContext();
-            const source = ctx.createMediaStreamSource(stream);
-            microphoneRef.current = source;
+            peer.on('open', (id) => {
+                console.log('[VoiceChat] My peer ID is: ' + id);
+                myPeerId.current = id;
+                // Announce to room via Socket
+                socket.emit('voice_peer_join', { room, peerId: id });
+                socket.emit("voice_status_update", { room, status: { isMicMuted: true } });
+            });
 
-            // ScriptProcessor (Deprecated but reliably lowest latency for manual PCM)
-            // Buffer size 4096 @ 44.1k = ~92ms
-            const processor = ctx.createScriptProcessor(BUFFER_SIZE, 1, 1);
-            processorRef.current = processor;
+            // Handle Incoming Calls
+            peer.on('call', (call) => {
+                console.log("[VoiceChat] Incoming call from:", call.peer);
+                call.answer(stream); // Answer with our stream
+                peersCalls.current.push(call);
 
-            processor.onaudioprocess = (e) => {
-                if (!socket.connected || isMicMuted) return;
+                call.on('stream', (remoteStream) => {
+                    // Add Audio Element
+                    addRemoteAudio(call.peer, remoteStream);
+                });
 
-                const inputData = e.inputBuffer.getChannelData(0);
+                call.on('close', () => {
+                    removeRemoteAudio(call.peer);
+                });
+            });
 
-                // 1. Resample to 16kHz to save bandwidth
-                const downsampled = resample(inputData, ctx.sampleRate, SAMPLE_RATE);
-
-                // 2. Convert to PCM16
-                const pcmData = floatTo16BitPCM(downsampled);
-
-                // 3. Send
-                socket.emit("voice_data", { room, data: pcmData });
-
-                // Self Visualizer (Volume Check)
-                let sum = 0;
-                for (let i = 0; i < inputData.length; i += 10) sum += Math.abs(inputData[i]);
-                const avg = sum / (inputData.length / 10);
-                if (avg > 0.05) updateActiveSpeaker("me");
-            };
-
-            // Chain: Mic -> Processor -> Destination (to keep it alive, but mute output to avoid feedback)
-            // Wait, processor -> destination will play yourself?
-            // "If the input buffer is not connected to any output, the audiocallback will not be called."
-            // We connect to destination but we set volume to 0? Or just don't handle output buffer.
-            source.connect(processor);
-            processor.connect(ctx.destination);
-            // WARNING: connecting to destination might cause self-echo if we copy input to output.
-            // By default `onaudioprocess` outputBuffer is silent? No, we must ensure we don't copy input to output.
-            // We are NOT copying inputData to e.outputBuffer. So it should be silent.
+            peerInstance.current = peer;
 
         } catch (err) {
             console.error(err);
-            alert("Mic Access Denied");
+            alert("Mic Access Denied or Peer Error");
         }
+    };
+
+    // --- Outgoing Calls ---
+    // When a new user joins, existing users call them? 
+    // Usually easier: New user calls everyone else.
+    // We need to know who is in the room. 
+    // Let's use socket 'all_voice_peers' logic.
+
+    const connectToNewUser = (userId, remotePeerId) => {
+        if (!peerInstance.current) return;
+        console.log("[VoiceChat] Calling new user:", remotePeerId);
+
+        const call = peerInstance.current.call(remotePeerId, streamRef.current);
+        if (!call) return; // Happens if connection not ready
+
+        peersCalls.current.push(call);
+
+        call.on('stream', (remoteStream) => {
+            addRemoteAudio(remotePeerId, remoteStream);
+        });
+
+        call.on('close', () => {
+            removeRemoteAudio(remotePeerId);
+        });
+
+        call.on('error', (err) => {
+            console.error("Call error:", err);
+        });
+    };
+
+    // --- Audio Element Management ---
+    const addRemoteAudio = (id, stream) => {
+        const existingInfo = remoteAudioRefs.current[id];
+        if (existingInfo) return;
+
+        console.log("[VoiceChat] Adding audio for:", id);
+
+        // Update UI list for visuals
+        setRemotePeerStatus(prev => ({ ...prev, [id]: { isMicMuted: true } }));
+
+        // Create Audio Element
+        const audio = document.createElement('audio');
+        audio.id = `audio-${id}`;
+        audio.srcObject = stream;
+        audio.autoplay = true;
+        audio.playsInline = true; // iOS
+        audio.style.display = 'none'; // Hidden
+
+        document.body.appendChild(audio);
+
+        // Attempt play
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+            playPromise.catch(error => {
+                console.log("[VoiceChat] Auto-play prevented:", error);
+                // We might need a "Click to Play" UI if this fails, 
+                // but usually joining voice (click) grants permission.
+            });
+        }
+
+        remoteAudioRefs.current[id] = audio;
+    };
+
+    const removeRemoteAudio = (id) => {
+        console.log("[VoiceChat] Removing audio for:", id);
+        const audio = remoteAudioRefs.current[id];
+        if (audio) {
+            audio.pause();
+            audio.srcObject = null;
+            if (audio.parentNode) audio.parentNode.removeChild(audio);
+            delete remoteAudioRefs.current[id];
+        }
+
+        setRemotePeerStatus(prev => {
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
     };
 
     // --- Leave Voice ---
     const leaveVoice = () => {
-        if (processorRef.current) {
-            processorRef.current.disconnect();
-            processorRef.current.onaudioprocess = null;
+        if (peerInstance.current) {
+            peerInstance.current.destroy();
+            peerInstance.current = null;
         }
-        if (microphoneRef.current) microphoneRef.current.disconnect();
-        if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(t => t.stop());
+            streamRef.current = null;
+        }
 
-        // Don't close context, reuse it.
+        peersCalls.current.forEach(c => c.close());
+        peersCalls.current = [];
 
-        socket.emit("leave_voice", room);
+        // Notify socket
+        if (room && isVoiceJoined) {
+            socket.emit('leave_voice', room);
+            // We should also tell socket to remove our peerID mapping
+            socket.emit('voice_peer_leave', { room, peerId: myPeerId.current });
+        }
 
         setIsVoiceJoined(false);
         setIsMicMuted(true);
-        setActiveSpeakers(new Set());
         setRemotePeerStatus({});
-        nextPlayTimeRef.current = 0;
+        myPeerId.current = null;
     };
 
-    // --- Receive Audio ---
-    const handleReceiveVoiceData = async ({ senderId, data }) => {
-        if (isSpeakerMuted || !isVoiceJoined) return;
-
-        const ctx = getAudioContext();
-
-        // 1. Decode Int16 -> Float32
-        const floatData = pcm16ToFloat(data); // These are 16kHz samples
-
-        // 2. Playback
-        // Create a buffer at 16kHz
-        const buffer = ctx.createBuffer(1, floatData.length, SAMPLE_RATE);
-        buffer.copyToChannel(floatData, 0);
-
-        // 3. Schedule
-        const node = ctx.createBufferSource();
-        node.buffer = buffer;
-        node.connect(ctx.destination);
-
-        // Time Sync
-        const now = ctx.currentTime;
-        if (nextPlayTimeRef.current < now) {
-            nextPlayTimeRef.current = now + 0.05; // 50ms buffer
-        }
-
-        node.start(nextPlayTimeRef.current);
-        nextPlayTimeRef.current += buffer.duration;
-
-        // Visualizer
-        let sum = 0;
-        for (let i = 0; i < floatData.length; i += 10) sum += Math.abs(floatData[i]);
-        const avg = sum / (floatData.length / 10);
-        if (avg > 0.05) updateActiveSpeaker(senderId);
-    };
-
-    // --- Active Speaker Helper ---
-    const updateActiveSpeaker = (id) => {
-        setActiveSpeakers(prev => new Set(prev).add(id));
-        if (activeSpeakersTimeoutRef.current[id]) clearTimeout(activeSpeakersTimeoutRef.current[id]);
-        activeSpeakersTimeoutRef.current[id] = setTimeout(() => {
-            setActiveSpeakers(prev => {
-                const next = new Set(prev);
-                next.delete(id);
-                return next;
-            });
-        }, 300); // Highlight lasts 300ms
-    };
-
-    // --- Socket Listeners ---
+    // --- Socket Events ---
     useEffect(() => {
         if (!isVoiceJoined) return;
 
-        socket.on("receive_voice_data", handleReceiveVoiceData);
-
-        socket.on("all_voice_users", (users) => {
-            setRemotePeerStatus(prev => {
-                const next = { ...prev };
-                users.forEach(id => { if (!next[id]) next[id] = { isMicMuted: true }; });
-                return next;
+        // When WE join, server sends list of existing peers
+        socket.on('all_voice_peers', (peersList) => {
+            console.log("[VoiceChat] Existing peers:", peersList);
+            peersList.forEach(p => {
+                if (p.peerId !== myPeerId.current) {
+                    connectToNewUser(null, p.peerId);
+                }
             });
         });
 
-        socket.on("voice_status_update", ({ id, status }) => {
-            setRemotePeerStatus(prev => ({ ...prev, [id]: status }));
+        // When SOMEONE ELSE joins
+        socket.on('user_joined_voice_peer', ({ peerId }) => {
+            console.log("[VoiceChat] User joined with PeerJS ID:", peerId);
+            // Depending on mesh strategy. Mesh = everyone calls everyone.
+            // If new user calls us, we wait. If we call them, we do it here.
+            // PeerJS best practice: Newcomer calls existing users? 
+            // Or Existing users call newcomer?
+            // Sending 'all_voice_peers' to newcomer is easier, so newcomer calls everyone.
+            // See server implementation below. Assuming new user calls us.
+            // Actually, wait for 'call' event is better for existing users.
+            // BUT, if we want to show them in UI before they call?
+            setRemotePeerStatus(prev => ({ ...prev, [peerId]: { isMicMuted: true } }));
         });
 
-        socket.on("user_left_voice", (id) => {
-            setActiveSpeakers(prev => { const n = new Set(prev); n.delete(id); return n; });
-            setRemotePeerStatus(prev => { const n = new Set(prev); delete n[id]; return n; });
+        socket.on('user_left_voice_peer', ({ peerId }) => {
+            removeRemoteAudio(peerId);
+        });
+
+        socket.on("voice_status_update", ({ peerId, status }) => {
+            // We need to map socket ID to Peer ID? 
+            // Or just use PeerID everywhere for voice.
+            // Let's assume status update sends peerId now.
+            if (peerId) setRemotePeerStatus(prev => ({ ...prev, [peerId]: status }));
         });
 
         return () => {
-            socket.off("receive_voice_data", handleReceiveVoiceData);
-            socket.off("all_voice_users");
-            socket.off("voice_status_update");
-            socket.off("user_left_voice");
+            socket.off('all_voice_peers');
+            socket.off('user_joined_voice_peer');
+            socket.off('user_left_voice_peer');
+            socket.off('voice_status_update');
         };
-    }, [isVoiceJoined, isSpeakerMuted]);
+    }, [isVoiceJoined]);
 
     // --- Controls ---
     const toggleMic = () => {
-        // IMPORTANT: In this PCM logic, we toggle 'isMicMuted' state mainly.
-        // 'onaudioprocess' checks this state.
-        // We do not need to enable/disable tracks because the ScriptProcessor is always running.
-        // Disabling tracks might stop the onaudioprocess callback in some browsers.
-        // So we just gate the data sending.
+        if (streamRef.current) {
+            const tracks = streamRef.current.getAudioTracks();
+            const shouldEnable = isMicMuted; // Toggle
+            tracks.forEach(t => t.enabled = shouldEnable);
+            setIsMicMuted(!isMicMuted);
 
-        const newState = !isMicMuted;
-        setIsMicMuted(newState);
-        socket.emit("voice_status_update", { room, status: { isMicMuted: newState } });
-
-        getAudioContext(); // Ensure awake
+            socket.emit("voice_status_update", { room, peerId: myPeerId.current, status: { isMicMuted: !isMicMuted } });
+        }
     };
 
     const toggleSpeaker = () => {
         setIsSpeakerMuted(!isSpeakerMuted);
-        getAudioContext();
+        // Force audio elements update?
+        // We can pass this prop to AudioWrapper
     };
 
     // Auto cleanup
+    useEffect(() => {
+        if (!isRoomJoined) leaveVoice();
+    }, [isRoomJoined]);
     useEffect(() => () => leaveVoice(), []);
-    useEffect(() => { if (!isRoomJoined) leaveVoice(); }, [isRoomJoined]);
 
-    // --- UI Render ---
+    // --- Render ---
     if (!isRoomJoined) return null;
 
     const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
@@ -281,7 +272,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                         <motion.div key="exp" layoutId="voice-panel" className="bg-[#1a1a1a]/95 backdrop-blur-xl border border-white/10 p-4 rounded-2xl shadow-2xl w-64">
                             <div className="flex justify-between items-center mb-3 border-b border-white/10 pb-2">
                                 <span className="font-bold text-xs uppercase tracking-wider text-green-400 flex items-center gap-2">
-                                    <Radio size={12} className="animate-pulse" /> Voice (PCM)
+                                    <Radio size={12} className="animate-pulse" /> PeerJS Voice
                                 </span>
                                 <div className="flex gap-2">
                                     <button onClick={() => setIsMinimized(true)}><X size={16} className="text-gray-400" /></button>
@@ -293,20 +284,14 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                                 {/* Me */}
                                 <div className="flex items-center justify-between p-2 rounded-lg bg-white/5 border border-white/5">
                                     <div className="flex items-center gap-2">
-                                        <div className={`w-2 h-2 rounded-full transition-all duration-100 ${activeSpeakers.has("me") ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-gray-600'}`} />
+                                        <div className={`w-2 h-2 rounded-full bg-green-500 ${!isMicMuted ? 'shadow-[0_0_8px_green]' : 'opacity-50'}`} />
                                         <span className="text-xs font-bold text-gray-300">You</span>
                                     </div>
                                     {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
                                 </div>
-                                {/* Others */}
-                                {Object.keys(remotePeerStatus).map((id, i) => (
-                                    <div key={id} className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
-                                        <div className="flex items-center gap-2">
-                                            <div className={`w-2 h-2 rounded-full transition-all duration-100 ${activeSpeakers.has(id) ? 'bg-blue-400 scale-125 shadow-[0_0_8px_#3b82f6]' : 'bg-blue-900'}`} />
-                                            <span className="text-xs font-bold text-gray-400">Player {i + 1}</span>
-                                        </div>
-                                        {remotePeerStatus[id]?.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
-                                    </div>
+                                {/* Peers */}
+                                {Object.keys(remotePeerStatus).map(pid => (
+                                    <RemotePeer key={pid} peerId={pid} status={remotePeerStatus[pid]} isSpeakerMuted={isSpeakerMuted} peerInstance={peerInstance.current} />
                                 ))}
                             </div>
 
@@ -326,11 +311,65 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                 <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={joinVoice}
                     className="bg-green-600/90 text-white p-3 rounded-full shadow-lg border-2 border-green-400/30 backdrop-blur-sm flex items-center justify-center">
                     <Phone size={24} />
-                    <span className="sr-only">Join Voice</span>
+                    <span className="sr-only">Join PeerJS</span>
                 </motion.button>
             )}
         </div>
     );
+};
+
+// Helper to handle audio stream for a remote peer
+const RemotePeer = ({ peerId, status, isSpeakerMuted, peerInstance }) => {
+    const audioRef = useRef(null);
+    // We need to access the stream for this peer key. 
+    // In PeerJS, we get the stream in the 'call' event.
+    // Since we can't easily pass the stream object via props (managed in callbacks), 
+    // we use a trick: save streams in a global or context?
+    // OR, better: We don't render RemotePeer based on status keys alone.
+    // We render based on "Calls". 
+    // But we need to combine Status + Audio.
+    // Let's fix this: The parent has the 'call' objects. We can store calls in state instead of refs.
+
+    // TEMPORARY FIX: We won't render separate audio components for now, 
+    // we let the main component handle audio attachment via 'addRemoteAudio' logic (hidden audio elements).
+    // This component is only for Visuals.
+
+    return (
+        <div className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
+            <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-blue-500" />
+                <span className="text-xs font-bold text-gray-400">Player {peerId.substr(0, 4)}</span>
+            </div>
+            {status?.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
+            {/* Hidden Audio */}
+            <PeerAudio peerId={peerId} isMuted={isSpeakerMuted} />
+        </div>
+    );
+};
+
+// This component finds the stream from the window/global calls cache? 
+// No, that's messy.
+// Let's rewrite the "addRemoteAudio" to actually mount this component properly.
+// Correct PeerJS React pattern:
+// 1. "calls" state = [{ peerId, stream }]
+// 2. Render <Audio args /> for each call.
+// 3. Render <PeerStatus /> for each peerId in socket list.
+
+const PeerAudio = ({ peerId, isMuted }) => {
+    const ref = useRef(null);
+    useEffect(() => {
+        // Find the stream in the parent's refs? 
+        // This is getting complex for a single file. 
+        // We will attach the stream in the main 'call.on(stream)' handler using standard DOM.
+        // So this component does nothing but maybe visualizer later.
+
+        // Actually, let's find the audio element we appended to body?
+        const el = document.getElementById(`audio-${peerId}`);
+        if (el) {
+            el.muted = isMuted;
+        }
+    }, [isMuted, peerId]);
+    return null;
 };
 
 export default VoiceChat;

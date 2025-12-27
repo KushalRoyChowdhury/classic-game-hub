@@ -202,44 +202,38 @@ io.on("connection", (socket) => {
 
     // --- Voice Chat Signaling ---
 
-    socket.on("join_voice", (roomId) => {
-        let vUsers = voiceUsers.get(roomId) || [];
-        // prevent dupes
-        if (!vUsers.includes(socket.id)) {
-            vUsers.push(socket.id);
-            voiceUsers.set(roomId, vUsers);
+    // --- PeerJS Signaling Support ---
+
+    socket.on('voice_peer_join', ({ room, peerId }) => {
+        // Store peerId
+        let vUsers = voiceUsers.get(room) || [];
+        // Check if existing socketId is there, update peerId
+        const existingIdx = vUsers.findIndex(u => u.socketId === socket.id);
+        if (existingIdx !== -1) {
+            vUsers[existingIdx].peerId = peerId;
+        } else {
+            vUsers.push({ socketId: socket.id, peerId });
         }
-        // Return list of OTHER users in voice to initiator
-        const usersInRoom = vUsers.filter(id => id !== socket.id);
-        socket.emit("all_voice_users", usersInRoom);
+        voiceUsers.set(room, vUsers);
+
+        // Notify others
+        socket.to(room).emit('user_joined_voice_peer', { peerId });
+
+        // Send full list to joiner
+        socket.emit('all_voice_peers', vUsers.filter(u => u.peerId));
     });
 
-    socket.on("sending_signal", payload => {
-        io.to(payload.userToSignal).emit('user_joined_voice', { signal: payload.signal, callerID: payload.callerID });
+    socket.on('voice_peer_leave', ({ room, peerId }) => {
+        let vUsers = voiceUsers.get(room) || [];
+        vUsers = vUsers.filter(u => u.peerId !== peerId);
+        voiceUsers.set(room, vUsers);
+        socket.to(room).emit('user_left_voice_peer', { peerId });
     });
 
-    socket.on("returning_signal", payload => {
-        io.to(payload.callerID).emit('receiving_returned_signal', { signal: payload.signal, id: socket.id });
-    });
-
-    socket.on("leave_voice", (roomId) => {
-        let vUsers = voiceUsers.get(roomId) || [];
-        vUsers = vUsers.filter(id => id !== socket.id);
-        voiceUsers.set(roomId, vUsers);
-        vUsers.forEach(id => io.to(id).emit("user_left_voice", socket.id));
-    });
-
-    socket.on("voice_status_update", ({ room, status }) => {
-        // Broadcast mute/unmute status to room (only to voice participants ideally, but room is fine)
-        if (room) {
-            socket.to(room).emit("voice_status_update", { id: socket.id, status });
+    socket.on("voice_status_update", ({ room, peerId, status }) => {
+        if (room && peerId) {
+            socket.to(room).emit("voice_status_update", { peerId, status });
         }
-    });
-
-    // --- Audio Streaming over WebSocket ---
-    socket.on("voice_data", ({ room, data }) => {
-        // Relay binary audio chunks to others
-        socket.to(room).emit("receive_voice_data", { senderId: socket.id, data });
     });
 });
 

@@ -284,7 +284,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                                 {/* Me */}
                                 <div className="flex items-center justify-between p-2 rounded-lg bg-white/5 border border-white/5">
                                     <div className="flex items-center gap-2">
-                                        <div className={`w-2 h-2 rounded-full bg-green-500 ${!isMicMuted ? 'shadow-[0_0_8px_green]' : 'opacity-50'}`} />
+                                        <LocalActivityIndicator stream={streamRef.current} isMicMuted={isMicMuted} />
                                         <span className="text-xs font-bold text-gray-300">You</span>
                                     </div>
                                     {isMicMuted ? <MicOff size={14} className="text-red-400" /> : <Mic size={14} className="text-gray-400" />}
@@ -318,58 +318,108 @@ const VoiceChat = ({ room, isRoomJoined }) => {
     );
 };
 
-// Helper to handle audio stream for a remote peer
-const RemotePeer = ({ peerId, status, isSpeakerMuted, peerInstance }) => {
-    const audioRef = useRef(null);
-    // We need to access the stream for this peer key. 
-    // In PeerJS, we get the stream in the 'call' event.
-    // Since we can't easily pass the stream object via props (managed in callbacks), 
-    // we use a trick: save streams in a global or context?
-    // OR, better: We don't render RemotePeer based on status keys alone.
-    // We render based on "Calls". 
-    // But we need to combine Status + Audio.
-    // Let's fix this: The parent has the 'call' objects. We can store calls in state instead of refs.
+const LocalActivityIndicator = ({ stream, isMicMuted }) => {
+    const [volume, setVolume] = useState(0);
 
-    // TEMPORARY FIX: We won't render separate audio components for now, 
-    // we let the main component handle audio attachment via 'addRemoteAudio' logic (hidden audio elements).
-    // This component is only for Visuals.
+    useEffect(() => {
+        if (!stream || isMicMuted) {
+            setVolume(0);
+            return;
+        }
 
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const analyser = audioContext.createAnalyser();
+        const microphone = audioContext.createMediaStreamSource(stream);
+        microphone.connect(analyser); // Intentionally not connecting to destination (feedback)
+        analyser.fftSize = 64;
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let rafId;
+
+        const checkVolume = () => {
+            analyser.getByteFrequencyData(dataArray);
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+            setVolume(sum / dataArray.length);
+            rafId = requestAnimationFrame(checkVolume);
+        };
+        checkVolume();
+
+        return () => {
+            cancelAnimationFrame(rafId);
+            audioContext.close();
+        };
+    }, [stream, isMicMuted]);
+
+    const isTalking = volume > 10;
+    return <div className={`w-2 h-2 rounded-full transition-all duration-150 ${isTalking ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-gray-600'}`} />;
+};
+
+const RemotePeer = ({ peerId, status, isSpeakerMuted }) => {
+    const [volume, setVolume] = useState(0);
+
+    useEffect(() => {
+        // Find DOM element
+        const audioEl = document.getElementById(`audio-${peerId}`);
+        if (!audioEl) {
+            console.log("No audio el for", peerId);
+            return;
+        }
+
+        // Handling Cross-Origin audio analysis is tricky without CORS, but PeerJS streams are usually fine.
+        // We need an AudioContext.
+        let audioContext, analyser, source, rafId;
+
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 64;
+
+            // We need to capture the stream from the element OR the srcObject
+            if (audioEl.srcObject) {
+                source = audioContext.createMediaStreamSource(audioEl.srcObject);
+                source.connect(analyser); // Don't connect source->dest, the Audio Element handles output usually. 
+                // Wait, if we use srcObject on Audio element, it plays.
+                // If we connect Source -> Analyser -> ?, we just analyze.
+            }
+
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            const check = () => {
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                setVolume(sum / dataArray.length);
+                rafId = requestAnimationFrame(check);
+            };
+            check();
+
+        } catch (e) {
+            console.error("Visualizer Error", e);
+        }
+
+        return () => {
+            if (rafId) cancelAnimationFrame(rafId);
+            if (audioContext) audioContext.close();
+        };
+    }, [peerId]);
+
+    // Handle Mute logic via side-effect here (cleaner than PeerAudio component)
+    useEffect(() => {
+        const audioEl = document.getElementById(`audio-${peerId}`);
+        if (audioEl) audioEl.muted = isSpeakerMuted;
+    }, [isSpeakerMuted, peerId]);
+
+
+    const isTalking = volume > 10;
     return (
         <div className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
             <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-blue-500" />
+                <div className={`w-2 h-2 rounded-full transition-all duration-150 ${isTalking ? 'bg-blue-400 scale-125 shadow-[0_0_8px_#3b82f6]' : 'bg-blue-800'}`} />
                 <span className="text-xs font-bold text-gray-400">Player {peerId.substr(0, 4)}</span>
             </div>
             {status?.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
-            {/* Hidden Audio */}
-            <PeerAudio peerId={peerId} isMuted={isSpeakerMuted} />
         </div>
     );
-};
-
-// This component finds the stream from the window/global calls cache? 
-// No, that's messy.
-// Let's rewrite the "addRemoteAudio" to actually mount this component properly.
-// Correct PeerJS React pattern:
-// 1. "calls" state = [{ peerId, stream }]
-// 2. Render <Audio args /> for each call.
-// 3. Render <PeerStatus /> for each peerId in socket list.
-
-const PeerAudio = ({ peerId, isMuted }) => {
-    const ref = useRef(null);
-    useEffect(() => {
-        // Find the stream in the parent's refs? 
-        // This is getting complex for a single file. 
-        // We will attach the stream in the main 'call.on(stream)' handler using standard DOM.
-        // So this component does nothing but maybe visualizer later.
-
-        // Actually, let's find the audio element we appended to body?
-        const el = document.getElementById(`audio-${peerId}`);
-        if (el) {
-            el.muted = isMuted;
-        }
-    }, [isMuted, peerId]);
-    return null;
 };
 
 export default VoiceChat;

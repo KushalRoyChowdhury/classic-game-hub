@@ -26,19 +26,25 @@ const AudioPlayer = ({ stream, isSpeakerMuted }) => {
 };
 
 
+// Polyfill for simple-peer in Vite environment
+if (typeof global === "undefined") {
+    window.global = window;
+}
+
 const VoiceChat = ({ room, isRoomJoined }) => {
     const [peers, setPeers] = useState([]);
     const [stream, setStream] = useState(null);
     const [isVoiceJoined, setIsVoiceJoined] = useState(false);
     const [isMicMuted, setIsMicMuted] = useState(false);
-    const [remotePeerStatus, setRemotePeerStatus] = useState({}); // { [socketId]: { isMicMuted: bool } }
-    const peersRef = useRef([]); // To keep track of peer objects directly { peerID, peer }
+    const [remotePeerStatus, setRemotePeerStatus] = useState({});
+    const peersRef = useRef([]);
     const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
     const [isMinimized, setIsMinimized] = useState(false);
 
-    // Add ref for the panel
+    // Refs
     const panelRef = useRef(null);
     const floatRef = useRef(null);
+    const streamRef = useRef(null); // Keep track of stream in ref for cleanup
 
     // Click outside handler
     useEffect(() => {
@@ -48,97 +54,127 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                 setIsMinimized(true);
             }
         };
-
         document.addEventListener("mousedown", handleClickOutside);
         return () => document.removeEventListener("mousedown", handleClickOutside);
     }, [isVoiceJoined, isMinimized]);
 
-    // --- Core Logic ---
+    // --- Actions ---
     const joinVoice = () => {
         if (!room) return;
+        console.log("[VoiceChat] Joining voice...");
 
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            alert("Voice Chat is not supported in this browser or requires a secure context (HTTPS/localhost). If you are on a local network, try using 'localhost' instead of IP.");
+            alert("Voice Chat not supported/secure context needed.");
             return;
         }
 
         navigator.mediaDevices.getUserMedia({ video: false, audio: true })
             .then(currentStream => {
+                console.log("[VoiceChat] Stream acquired");
                 setStream(currentStream);
+                streamRef.current = currentStream;
                 setIsVoiceJoined(true);
-                setIsMinimized(false); // Expand on join
-
-                socket.emit("join_voice", room);
-
-                // Listen for other users ALREADY in call -> We call them (Initiator)
-                socket.on("all_voice_users", (users) => {
-                    const peersList = [];
-                    users.forEach(userID => {
-                        const peer = createPeer(userID, socket.id, currentStream);
-                        peersRef.current.push({
-                            peerID: userID,
-                            peer,
-                        });
-                        peersList.push({
-                            peerID: userID,
-                            peer,
-                        });
-                    });
-                    setPeers(peersList);
-                });
-
-                // Listen for NEW user joining -> They call us (Receiver)
-                socket.on("user_joined_voice", (payload) => {
-                    const peer = addPeer(payload.signal, payload.callerID, currentStream);
-                    peersRef.current.push({
-                        peerID: payload.callerID,
-                        peer,
-                    });
-                    setPeers(users => [...users, { peerID: payload.callerID, peer }]);
-                });
-
-                socket.on("receiving_returned_signal", (payload) => {
-                    const item = peersRef.current.find(p => p.peerID === payload.id);
-                    if (item) {
-                        item.peer.signal(payload.signal);
-                    }
-                });
-
-                socket.on("user_left_voice", (id) => {
-                    const peerObj = peersRef.current.find(p => p.peerID === id);
-                    if (peerObj) {
-                        peerObj.peer.destroy();
-                    }
-                    const newPeers = peersRef.current.filter(p => p.peerID !== id);
-                    peersRef.current = newPeers;
-                    setPeers(newPeers);
-
-                    // Cleanup status
-                    setRemotePeerStatus(prev => {
-                        const next = { ...prev };
-                        delete next[id];
-                        return next;
-                    });
-                });
-
-                socket.on("voice_status_update", ({ id, status }) => {
-                    setRemotePeerStatus(prev => ({
-                        ...prev,
-                        [id]: status
-                    }));
-                });
-
+                setIsMinimized(false);
             })
             .catch(err => {
-                console.error("Failed to get local stream", err);
+                console.error("[VoiceChat] Failed to get stream", err);
                 alert("Could not access microphone.");
             });
     };
 
+    // --- Socket & Peer Logic ---
+    useEffect(() => {
+        if (!isVoiceJoined || !stream || !room) return;
+
+        console.log("[VoiceChat] Initializing socket listeners for room:", room);
+        socket.emit("join_voice", room);
+
+        // 1. Existing users in room
+        const handleAllUsers = (users) => {
+            console.log("[VoiceChat] existing users:", users);
+            // Cleanup old
+            peersRef.current.forEach(p => { try { p.peer.destroy(); } catch (e) { } });
+            peersRef.current = [];
+
+            const peersList = [];
+            users.forEach(userID => {
+                const peer = createPeer(userID, socket.id, stream);
+                peersRef.current.push({ peerID: userID, peer });
+                peersList.push({ peerID: userID, peer });
+            });
+            setPeers(peersList);
+        };
+
+        // 2. New user joining (Incoming Call)
+        const handleUserJoined = (payload) => {
+            console.log("[VoiceChat] User joined (incoming signal):", payload.callerID);
+
+            // Remove existing peer if any (deduplication)
+            const existingIdx = peersRef.current.findIndex(p => p.peerID === payload.callerID);
+            if (existingIdx !== -1) {
+                console.warn("[VoiceChat] Duplicate peer detected, replacing:", payload.callerID);
+                try { peersRef.current[existingIdx].peer.destroy(); } catch (e) { }
+                peersRef.current.splice(existingIdx, 1);
+            }
+
+            const peer = addPeer(payload.signal, payload.callerID, stream);
+            peersRef.current.push({ peerID: payload.callerID, peer });
+
+            setPeers(prev => {
+                const filtered = prev.filter(p => p.peerID !== payload.callerID);
+                return [...filtered, { peerID: payload.callerID, peer }];
+            });
+        };
+
+        // 3. Receive signal response (Answer)
+        const handleReturningSignal = (payload) => {
+            console.log("[VoiceChat] Received returned signal from:", payload.id);
+            const item = peersRef.current.find(p => p.peerID === payload.id);
+            if (item) {
+                item.peer.signal(payload.signal);
+            }
+        };
+
+        // 4. User left
+        const handleUserLeft = (id) => {
+            console.log("[VoiceChat] User left:", id);
+            const peerObj = peersRef.current.find(p => p.peerID === id);
+            if (peerObj) peerObj.peer.destroy();
+            const newPeers = peersRef.current.filter(p => p.peerID !== id);
+            peersRef.current = newPeers;
+            setPeers(newPeers);
+            setRemotePeerStatus(prev => {
+                const next = { ...prev };
+                delete next[id];
+                return next;
+            });
+        };
+
+        const handleStatusUpdate = ({ id, status }) => {
+            setRemotePeerStatus(prev => ({ ...prev, [id]: status }));
+        };
+
+        socket.on("all_voice_users", handleAllUsers);
+        socket.on("user_joined_voice", handleUserJoined);
+        socket.on("receiving_returned_signal", handleReturningSignal);
+        socket.on("user_left_voice", handleUserLeft);
+        socket.on("voice_status_update", handleStatusUpdate);
+
+        return () => {
+            socket.off("all_voice_users", handleAllUsers);
+            socket.off("user_joined_voice", handleUserJoined);
+            socket.off("receiving_returned_signal", handleReturningSignal);
+            socket.off("user_left_voice", handleUserLeft);
+            socket.off("voice_status_update", handleStatusUpdate);
+        };
+    }, [isVoiceJoined, stream, room]);
+
     const leaveVoice = () => {
-        if (stream) {
-            stream.getTracks().forEach(track => track.stop());
+        // Stop all tracks
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
             setStream(null);
+            streamRef.current = null;
         }
 
         // Notify server
@@ -147,10 +183,12 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         }
 
         // Destroy all peers
-        peersRef.current.forEach(p => {
-            if (p.peer) p.peer.destroy();
-        });
-        peersRef.current = [];
+        if (peersRef.current) {
+            peersRef.current.forEach(p => {
+                if (p.peer) p.peer.destroy();
+            });
+            peersRef.current = [];
+        }
         setPeers([]);
         setIsVoiceJoined(false);
         setIsMicMuted(false);
@@ -158,12 +196,7 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         setRemotePeerStatus({});
         setIsMinimized(false);
 
-        // Remove listeners
-        socket.off("all_voice_users");
-        socket.off("user_joined_voice");
-        socket.off("receiving_returned_signal");
-        socket.off("user_left_voice");
-        socket.off("voice_status_update");
+        // Note: Listeners are cleaned up by useEffect when isVoiceJoined becomes false
     };
 
     const createPeer = (userToSignal, callerID, stream) => {
@@ -228,6 +261,23 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isRoomJoined]);
+
+    // Reconnection Handler
+    useEffect(() => {
+        const handleReconnect = () => {
+            if (isVoiceJoined && room) {
+                console.log("Reconnecting to voice...");
+                // Note: verify if we need to clear peers. 
+                // WebRTC connections might persist independent of socket.
+                // However, for discovery of new users or re-sync, re-joining is safe.
+                // If the server lost state, we NEED to re-join to be discoverable.
+                socket.emit("join_voice", room);
+            }
+        };
+
+        socket.on("connect", handleReconnect);
+        return () => socket.off("connect", handleReconnect);
+    }, [isVoiceJoined, room]);
 
     const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
 

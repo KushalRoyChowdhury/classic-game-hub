@@ -249,6 +249,18 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
         socket.on("receive_voice_data", handleReceiveVoiceData);
 
+        // Initial User List (for UI visibility)
+        socket.on("all_voice_users", (users) => {
+            console.log("[VoiceChat] Existing users:", users);
+            setRemotePeerStatus(prev => {
+                const next = { ...prev };
+                users.forEach(id => {
+                    if (!next[id]) next[id] = { isMicMuted: true }; // Assume muted initially or until update
+                });
+                return next;
+            });
+        });
+
         // Voice Status (Mute icons)
         socket.on("voice_status_update", ({ id, status }) => {
             setRemotePeerStatus(prev => ({ ...prev, [id]: status }));

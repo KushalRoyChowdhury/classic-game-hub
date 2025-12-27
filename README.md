@@ -13,6 +13,7 @@
   [![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=for-the-badge&logo=node.js)](https://nodejs.org/)
 
   <p align="center">
+    <a href="https://classic-game-hub.onrender.com"><strong>🚀 Try Now</strong></a> •
     <a href="#-features">Features</a> •
     <a href="#-getting-started">Getting Started</a> •
     <a href="#-how-to-play">How to Play</a> •
@@ -39,6 +40,10 @@ Built with a "Neon Retro" aesthetic, glassmorphism UI, and smooth Framer Motion 
   - **PvP (Local)**: Play on the same device.
   - **PvAI**: Challenge a smart AI bot (Tic-Tac-Toe & Snake & Ladders).
   - **Online**: Create or join rooms to play with friends anywhere. (*Note: This mode does not use optimistic updates; actions are confirmed by the server to ensure fairness. High ping may cause slight delays. The default server is located in Singapore; average ping tested in India is ~50ms on WiFi. If you face high latency, try hosting the server locally.*)
+- **🎙️ Real-Time Voice Chat**:
+  - **Peer-to-Peer**: Powered by WebRTC (via Simple Peer) for low-latency communication.
+  - **Full Control**: Mute microphone, deafen speakers, and see visual indicators of who is in the call.
+  - **Mobile Friendly**: Collapsible floating UI that stays out of your way while you play.
 - **🎨 Premium UI/UX**:
   - **Glassmorphism Design**: Sleek, modern, transparent aesthetics.
   - **Dark Mode**: Optimized for comfortable gaming.
@@ -54,6 +59,7 @@ Built with a "Neon Retro" aesthetic, glassmorphism UI, and smooth Framer Motion 
 - **Tailwind CSS 4**: Next-gen utility-first styling.
 - **Framer Motion**: Complex, fluid layout animations.
 - **Lucide React**: Beautiful, consistent iconography.
+- **Simple Peer**: WebRTC wrapper for easy P2P voice connections.
 
 ### Server
 - **Node.js**: Runtime environment.

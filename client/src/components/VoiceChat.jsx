@@ -4,6 +4,20 @@ import socket from '../socket';
 import { Mic, MicOff, Volume2, VolumeX, X, Phone, Users, Radio } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
+// Polyfills for simple-peer in Vite environment
+import { Buffer } from 'buffer';
+import process from 'process';
+
+if (typeof window !== 'undefined') {
+    if (!window.global) window.global = window;
+    if (!window.Buffer) window.Buffer = Buffer;
+    if (!window.process) window.process = process;
+    // Essential for simple-peer/readable-stream
+    if (!window.process.nextTick) {
+        window.process.nextTick = (cb, ...args) => setTimeout(() => cb(...args), 0);
+    }
+}
+
 // Separate component for rendering audio allows for better react lifecycle management of streams
 const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
     const audioRef = useRef();
@@ -73,11 +87,6 @@ const AudioPlayer = ({ stream, isSpeakerMuted, onVolumeChange }) => {
     );
 };
 
-
-// Polyfill for simple-peer in Vite environment
-if (typeof global === "undefined") {
-    window.global = window;
-}
 
 const VoiceChat = ({ room, isRoomJoined }) => {
     const [peers, setPeers] = useState([]);

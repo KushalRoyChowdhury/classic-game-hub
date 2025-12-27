@@ -8,6 +8,7 @@ import socket from '../socket'
 import Toast, { useToast } from './Toast'
 import PingDisplay from './PingDisplay'
 import ConnectionStatus from './ConnectionStatus'
+import VoiceChat from './VoiceChat'
 
 function TicTacToe() {
     const [squares, setSquares] = useState(Array(9).fill(null))
@@ -515,6 +516,7 @@ function TicTacToe() {
             </div>
 
             <Toast messages={toasts} removeToast={removeToast} />
+            <VoiceChat room={room} isRoomJoined={gameMode === 'online' && isRoomJoined} />
         </div>
     );
 }

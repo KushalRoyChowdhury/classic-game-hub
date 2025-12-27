@@ -21,6 +21,8 @@ const io = new Server(server, {
 
 // Room Storage: { [roomId]: GameInstance }
 const rooms = new Map();
+// Voice Storage: { [roomId]: [socketId, ...] }
+const voiceUsers = new Map();
 // Socket to Room mapping
 const socketRoomMap = new Map();
 
@@ -159,9 +161,19 @@ io.on("connection", (socket) => {
         if (game) {
             game.removePlayer(socket.id);
             socket.leave(room);
+            socket.leave(room);
             socket.to(room).emit("opponent_left");
             io.to(room).emit("receive_message", game.getState());
             socketRoomMap.delete(socket.id);
+
+            // Voice Cleanup
+            let vUsers = voiceUsers.get(room) || [];
+            if (vUsers.includes(socket.id)) {
+                vUsers = vUsers.filter(id => id !== socket.id);
+                voiceUsers.set(room, vUsers);
+                // Notify others to remove peer
+                vUsers.forEach(id => io.to(id).emit("user_left_voice", socket.id));
+            }
         }
     });
 
@@ -174,9 +186,54 @@ io.on("connection", (socket) => {
                 // Notify others
                 io.to(roomId).emit("receive_message", game.getState());
             }
+
+            // Voice Cleanup
+            let vUsers = voiceUsers.get(roomId) || [];
+            if (vUsers.includes(socket.id)) {
+                vUsers = vUsers.filter(id => id !== socket.id);
+                voiceUsers.set(roomId, vUsers);
+                vUsers.forEach(id => io.to(id).emit("user_left_voice", socket.id));
+            }
+
             socketRoomMap.delete(socket.id);
         }
         // console.log("User Disconnected", socket.id);
+    });
+
+    // --- Voice Chat Signaling ---
+
+    socket.on("join_voice", (roomId) => {
+        let vUsers = voiceUsers.get(roomId) || [];
+        // prevent dupes
+        if (!vUsers.includes(socket.id)) {
+            vUsers.push(socket.id);
+            voiceUsers.set(roomId, vUsers);
+        }
+        // Return list of OTHER users in voice to initiator
+        const usersInRoom = vUsers.filter(id => id !== socket.id);
+        socket.emit("all_voice_users", usersInRoom);
+    });
+
+    socket.on("sending_signal", payload => {
+        io.to(payload.userToSignal).emit('user_joined_voice', { signal: payload.signal, callerID: payload.callerID });
+    });
+
+    socket.on("returning_signal", payload => {
+        io.to(payload.callerID).emit('receiving_returned_signal', { signal: payload.signal, id: socket.id });
+    });
+
+    socket.on("leave_voice", (roomId) => {
+        let vUsers = voiceUsers.get(roomId) || [];
+        vUsers = vUsers.filter(id => id !== socket.id);
+        voiceUsers.set(roomId, vUsers);
+        vUsers.forEach(id => io.to(id).emit("user_left_voice", socket.id));
+    });
+
+    socket.on("voice_status_update", ({ room, status }) => {
+        // Broadcast mute/unmute status to room (only to voice participants ideally, but room is fine)
+        if (room) {
+            socket.to(room).emit("voice_status_update", { id: socket.id, status });
+        }
     });
 });
 

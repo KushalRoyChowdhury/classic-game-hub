@@ -4,6 +4,7 @@ import { User, Bot, Dice5, Trophy, RefreshCcw, Globe, LogIn, MonitorPlay, Users,
 import socket from '../socket'
 import PingDisplay from './PingDisplay'
 import ConnectionStatus from './ConnectionStatus'
+import VoiceChat from './VoiceChat'
 
 // Game Constants
 const BOARD_SIZE = 100;
@@ -697,6 +698,7 @@ function SnakeAndLadders() {
                     </motion.div>
                 )}
             </AnimatePresence>
+            <VoiceChat room={room} isRoomJoined={gameMode === 'online' && isRoomJoined} />
         </div>
     );
 }

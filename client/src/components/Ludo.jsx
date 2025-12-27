@@ -20,6 +20,7 @@ const COLOR_STYLES = {
 import socket from '../socket'
 import PingDisplay from './PingDisplay'
 import ConnectionStatus from './ConnectionStatus'
+import VoiceChat from './VoiceChat'
 
 const SAFE_SPOTS = [0, 8, 13, 21, 26, 34, 39, 47]; // Star positions global indices
 const HOME_ENTRY_POS = 50; // Last step on main path
@@ -974,6 +975,7 @@ function Ludo() {
                     </motion.div>
                 )}
             </AnimatePresence>
+            <VoiceChat room={room} isRoomJoined={gameMode === 'online' && isRoomJoined} />
         </div>
     );
 }

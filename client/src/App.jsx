@@ -38,8 +38,6 @@ function App() {
     return (
         <div className="min-h-screen select-none bg-[#0a0a0a] text-white selection:bg-cyan-500/30 font-sans overflow-x-hidden relative cursor-none flex flex-col">
             <CustomCursor />
-            <div className="fixed inset-0 z-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none"></div>
-
             {/* Ambient Light */}
             <div className="fixed top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-blue-500/10 blur-[120px] pointer-events-none" />
             <div className="fixed bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-purple-500/10 blur-[120px] pointer-events-none" />

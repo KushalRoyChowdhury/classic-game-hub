@@ -89,6 +89,7 @@ function Ludo() {
     const [showReactionPicker, setShowReactionPicker] = useState(false);
     const REACTION_EMOJIS = ["😀", "😂", "😎", "😭", "😡", "🎉", "🔥", "🎲", "👻"];
     const reactionPickerRef = useRef(null);
+    const playersRef = useRef(players);
 
     useEffect(() => {
         function handleClickOutside(event) {
@@ -123,14 +124,20 @@ function Ludo() {
         }
     }, []);
 
-
+    // Placeholder for playSound function
+    const playSound = (soundName) => {
+        // console.log(`Playing sound: ${soundName}`);
+        // Implement actual sound playing logic here
+    };
 
     // Socket Handlers
     useEffect(() => {
         socket.on("connect", () => {
-            // Reconnect logic handled manually or via joinRoom
-            if (gameMode === 'online' && room && isRoomJoined) {
-                socket.emit("join_room", { room, gameType: 'ludo', action: 'join', userName });
+            if (onlineView === 'join') {
+                // Re-establish
+                if (gameMode === 'online' && room && isRoomJoined) {
+                    socket.emit("join_room", { room, gameType: 'ludo', action: 'join', userName });
+                }
             }
         });
 
@@ -149,14 +156,17 @@ function Ludo() {
             setPublicRooms(data);
         });
 
-        socket.on("receive_message", (data) => {
+        socket.on("receive_message", async (data) => {
             if (data.seats) {
                 setConnectedPlayers(data.seats.filter(s => s !== null).length);
             }
 
             if (data.players) {
-                // Sync Players & Transform tokens from Server (Array of Numbers) to Client (Array of Objects)
-                const transformedPlayers = data.players.map(p => ({
+                const currentPlayers = playersRef.current;
+                const newRawPlayers = data.players;
+
+                // Transform first to be compatible
+                const transformedPlayers = newRawPlayers.map(p => ({
                     ...p,
                     tokens: p.tokens.map((pos, tid) => ({
                         id: tid,
@@ -165,7 +175,85 @@ function Ludo() {
                     })),
                     finishedCount: p.finishedTokens || 0
                 }));
-                setPlayers(transformedPlayers);
+
+                let moverIdx = -1;
+                let movedTokenIdx = -1;
+
+                if (currentPlayers.length > 0) {
+                    // Find diff
+                    for (let i = 0; i < newRawPlayers.length; i++) {
+                        // Check position diff. 
+                        // Note: newRawPlayers[i].tokens is array of numbers. currentPlayers[i].tokens is array of objects.
+                        for (let t = 0; t < 4; t++) {
+                            const oldPos = currentPlayers[i] && currentPlayers[i].tokens[t] ? currentPlayers[i].tokens[t].pos : -1; // -1 for in base
+                            const newPos = newRawPlayers[i].tokens[t];
+
+                            // Only care if position INCREASES (forward move) or moving out of home (-1 -> start pos)
+                            // If position decreases (reset to -1), it's a capture, handled by snap.
+                            if (newPos !== oldPos) {
+                                // Prioritize updating the "active" mover.
+                                // If multiple changed (capture), we focus on the one that moved FORWARD or started.
+                                // This is heuristic but works for standard turn based Ludo.
+                                if (newPos > oldPos || (oldPos === -1 && newPos > -1)) {
+                                    moverIdx = i;
+                                    movedTokenIdx = t;
+                                    break;
+                                }
+                            }
+                        }
+                        if (moverIdx !== -1) break;
+                    }
+                }
+
+                if (moverIdx !== -1 && movedTokenIdx !== -1) {
+                    setIsAnimating(true);
+                    const oldPos = currentPlayers[moverIdx].tokens[movedTokenIdx].pos;
+                    const newPos = newRawPlayers[moverIdx].tokens[movedTokenIdx];
+
+                    // Determine range
+                    // If oldPos=-1 (home), jump to start pos is usually 1 step in Ludo "logic" but visually distinct.
+                    // But here we can just loop.
+
+                    let curr = oldPos;
+                    // Guard against infinite loop
+                    const maxSteps = 57;
+                    let stepsTaken = 0;
+
+                    // Only animate if forward
+                    if (newPos > oldPos || (oldPos === -1 && newPos > -1)) {
+                        while (curr < newPos && stepsTaken < maxSteps) {
+                            curr++;
+                            stepsTaken++;
+
+                            // Visual Update Step
+                            /* eslint-disable no-loop-func */
+                            setPlayers(prev => {
+                                const copy = [...prev];
+                                const p = { ...copy[moverIdx] };
+                                const t = [...p.tokens];
+                                t[movedTokenIdx] = { ...t[movedTokenIdx], pos: curr };
+                                p.tokens = t;
+                                copy[moverIdx] = p;
+                                return copy;
+                            });
+
+                            playSound('move');
+                            await new Promise(r => setTimeout(r, 200));
+                        }
+                    }
+
+                    // Final Snap
+                    setPlayers(transformedPlayers);
+                    if (newPos === 56 || newPos >= 56) playSound('win'); // Reached home center
+
+                    // Check for captures (if any OTHER token went to -1)
+                    // ... implied by setPlayers(transformedPlayers)
+
+                    setIsAnimating(false);
+                } else {
+                    // No detectable forward move (maybe capture only? or reset? or initial load?)
+                    setPlayers(transformedPlayers);
+                }
             }
             if (data.currentTurn !== undefined) setTurn(data.currentTurn);
             if (data.diceValue !== undefined) setDice(data.diceValue);

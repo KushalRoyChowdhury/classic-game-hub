@@ -67,6 +67,8 @@ function SnakeAndLadders() {
     const [board, setBoard] = useState(BOARD_PRESETS[0]);
     const [isAnimating, setIsAnimating] = useState(false);
     const [editingPlayerId, setEditingPlayerId] = useState(null);
+    const playersRef = useRef(players);
+    const playSound = (name) => { }; // Placeholder for sound
 
     // Online Config
     const [room, setRoom] = useState("");
@@ -138,6 +140,11 @@ function SnakeAndLadders() {
         }
     }, [onlineView]);
 
+    // Sync playersRef for socket access
+    useEffect(() => {
+        playersRef.current = players;
+    }, [players]);
+
     // Socket Handlers
     useEffect(() => {
         socket.on("public_rooms_list", (data) => {
@@ -156,24 +163,102 @@ function SnakeAndLadders() {
             sessionStorage.removeItem('active_room_id');
         });
 
-        socket.on("receive_message", (data) => {
+        socket.on("receive_message", async (data) => {
             // Server Rules Update
             if (data.players) {
-                setPlayers(prev => {
-                    // Map server players to local structure
-                    return data.players.map((p, i) => ({
-                        ...p,
-                        id: i + 1,
-                        config: PLAYER_CONFIGS[i] || PLAYER_CONFIGS[0],
-                        hasStarted: p.hasStarted !== undefined ? p.hasStarted : false
-                    }));
-                });
-                // Ensure playerCount matches server's reality or config
-                setPlayerCount(data.players.length);
+                const currentPlayers = playersRef.current;
+                const newServerPlayers = data.players;
+                let movedPlayerIdx = -1;
+
+                // Check for movement if we have existing players
+                if (currentPlayers.length > 0) {
+                    for (let i = 0; i < newServerPlayers.length; i++) {
+                        // Check strictly for position change or hasStarted change
+                        if (currentPlayers[i] && (newServerPlayers[i].pos !== currentPlayers[i].pos || newServerPlayers[i].hasStarted !== currentPlayers[i].hasStarted)) {
+                            movedPlayerIdx = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (movedPlayerIdx !== -1 && data.diceValue) {
+                    // Online Animation
+                    setIsAnimating(true);
+                    if (data.diceValue) setDiceValue(data.diceValue);
+
+                    const player = currentPlayers[movedPlayerIdx];
+                    const targetData = newServerPlayers[movedPlayerIdx];
+
+                    // 1. Roll start (for new players)
+                    if (!player.hasStarted && targetData.hasStarted) {
+                        // Visual start
+                        setPlayers(prev => prev.map((p, i) => i === movedPlayerIdx ? { ...p, hasStarted: true, pos: 1 } : p));
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+
+                    // 2. Step-by-step move
+                    let currentPos = player.hasStarted ? player.pos : 1;
+                    // If just started, we are at 1. The dice roll counts from there? 
+                    // Usually if you roll 1 to start, you stay at 1. If 6, you start and get another turn or move 6?
+                    // Simplified: We assume server knows best. We calculate intermediate target loop.
+
+                    // Actually, if we just rely on server diff, we might miss the "ladder" intermediate step.
+                    // But we have diceValue.
+                    // So we move (currentPos + diceValue) steps.
+
+                    if (targetData.pos !== currentPos) {
+                        const rollTarget = currentPos + (data.diceValue || 0);
+                        // Note: bounce logic and >100 logic handled by server, so rollTarget might be >100.
+                        // We iterate until we are visually close or reach max moves.
+                        // Or safer: Just move 1 step at a time until we hit 'rollTarget' (clamped to 100)
+                        // THEN jump to final 'targetData.pos' (which handles snake/ladder).
+
+                        // Limit loop to avoiding infinite hangs
+                        const movesToMake = data.diceValue || 0;
+                        if (movesToMake > 0 && player.hasStarted) {
+                            for (let i = 1; i <= movesToMake; i++) {
+                                const nextStepPos = currentPos + 1;
+                                if (nextStepPos > 100) break; // Don't animate overshoot visually for now to save complexity
+
+                                setPlayers(prev => prev.map((p, idx) => idx === movedPlayerIdx ? { ...p, pos: nextStepPos } : p));
+                                playSound('move');
+                                await new Promise(r => setTimeout(r, 300));
+                                currentPos = nextStepPos;
+                            }
+                        }
+                    }
+
+                    // 3. Final Snap (handles snakes/ladders/overshoots/start conditions)
+                    setPlayers(prev => {
+                        return newServerPlayers.map((p, i) => ({
+                            ...p,
+                            id: i + 1,
+                            config: PLAYER_CONFIGS[i] || PLAYER_CONFIGS[0],
+                            hasStarted: p.hasStarted !== undefined ? p.hasStarted : false
+                        }));
+                    });
+
+                    if (targetData.pos !== currentPos && targetData.pos < currentPos) playSound('snake');
+                    if (targetData.pos !== currentPos && targetData.pos > currentPos + 1) playSound('ladder'); // Simple heuristic
+
+                    setIsAnimating(false);
+
+                } else {
+                    // Initial Sync or multiple updates
+                    setPlayers(prev => {
+                        return data.players.map((p, i) => ({
+                            ...p,
+                            id: i + 1,
+                            config: PLAYER_CONFIGS[i] || PLAYER_CONFIGS[0],
+                            hasStarted: p.hasStarted !== undefined ? p.hasStarted : false
+                        }));
+                    });
+                    setPlayerCount(data.players.length);
+                }
             }
 
             if (data.currentPlayerIndex !== undefined) setCurrentPlayerIndex(data.currentPlayerIndex);
-            if (data.diceValue !== undefined) setDiceValue(data.diceValue);
+            if (data.diceValue !== undefined && !isAnimating) setDiceValue(data.diceValue); // Only set if not animating to avoid flash
 
             if (Array.isArray(data.moveLog)) {
                 setMoveLog(data.moveLog);
@@ -188,6 +273,7 @@ function SnakeAndLadders() {
             }
 
             if (data.winner) {
+                // Determine winner config
                 const winnerConfig = PLAYER_CONFIGS[(data.winner.id - 1)] || PLAYER_CONFIGS[0];
                 setWinner({ ...data.winner, config: winnerConfig });
             }

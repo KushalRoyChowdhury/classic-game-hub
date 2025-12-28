@@ -36,18 +36,21 @@ io.on("connection", (socket) => {
 
     // Join a room with strict Create/Join logic
     socket.on("join_room", (data) => {
-        let roomId, gameType, maxPlayers, action;
+        let roomId, gameType, maxPlayers, action, isPublic, userName;
 
         if (typeof data === 'object') {
             roomId = data.room;
             gameType = data.gameType || 'tictactoe';
             maxPlayers = data.maxPlayers || 2;
             action = data.action || 'join'; // default to join for compatibility if missing
+            isPublic = !!data.isPublic;
+            userName = data.userName;
         } else {
             // Deprecated string-only support (treat as join)
             roomId = data;
             gameType = 'tictactoe'; // Guess
             action = 'join';
+            isPublic = false;
         }
 
         // Validate Create/Join
@@ -80,11 +83,16 @@ io.on("connection", (socket) => {
             } else {
                 game = new TicTacToe();
             }
+            // Bind Metadata
+            game.isPublic = isPublic;
+            game.gameType = gameType; // Ensure type is stored
+            game.roomId = roomId; // Store ID for list iteration
+
             rooms.set(roomId, game);
         }
 
         // Add Player
-        const seatIndex = game.addPlayer(socket.id);
+        const seatIndex = game.addPlayer(socket.id, userName);
         if (seatIndex !== -1) {
             socketRoomMap.set(socket.id, roomId);
 
@@ -109,6 +117,27 @@ io.on("connection", (socket) => {
         }
     });
 
+    // List Public Rooms
+    socket.on("get_public_rooms", ({ gameType } = {}) => {
+        const publicRooms = [];
+        for (const [id, game] of rooms.entries()) {
+            if (game.isPublic && (!gameType || game.gameType === gameType)) {
+                // Count active players
+                const occupied = game.seats ? game.seats.filter(s => s !== null).length : 0;
+                const max = game.maxPlayers || 2;
+                if (occupied < max) {
+                    publicRooms.push({
+                        id,
+                        players: occupied,
+                        max,
+                        gameType: game.gameType
+                    });
+                }
+            }
+        }
+        socket.emit("public_rooms_list", publicRooms);
+    });
+
     // Rematch Logic
     socket.on("request_rematch", (roomId) => {
         // Relay to others in room
@@ -126,6 +155,12 @@ io.on("connection", (socket) => {
         } else {
             socket.to(room).emit("rematch_declined");
         }
+    });
+
+    // Reaction Logic
+    socket.on("send_reaction", (data) => {
+        // Broadcast reaction to EVERYONE in the room including sender
+        io.to(data.room).emit("receive_reaction", data);
     });
 
     // Support "make_move" (New Protocol)

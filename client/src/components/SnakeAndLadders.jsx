@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { User, Bot, Dice5, Trophy, RefreshCcw, Globe, LogIn, MonitorPlay, Users, ArrowLeft, LogOut } from 'lucide-react'
+import { User, Bot, Dice5, Trophy, RefreshCcw, RefreshCw, Globe, LogIn, MonitorPlay, Users, ArrowLeft, LogOut, Copy, Check, Share2, Smile, X, Pencil } from 'lucide-react'
 import socket from '../socket'
 import PingDisplay from './PingDisplay'
 import ConnectionStatus from './ConnectionStatus'
 import VoiceChat from './VoiceChat'
+import useGameStore from '../store/gameStore'
 
 // Game Constants
 const BOARD_SIZE = 100;
@@ -64,69 +65,85 @@ function SnakeAndLadders() {
     const [winner, setWinner] = useState(null);
     const [moveLog, setMoveLog] = useState([]);
     const [board, setBoard] = useState(BOARD_PRESETS[0]);
+    const [isAnimating, setIsAnimating] = useState(false);
+    const [editingPlayerId, setEditingPlayerId] = useState(null);
 
     // Online Config
     const [room, setRoom] = useState("");
     const [isRoomJoined, setIsRoomJoined] = useState(false);
-    const [onlineView, setOnlineView] = useState('menu'); // 'menu', 'create', 'join'
+    const [onlineView, setOnlineView] = useState('menu'); // 'menu', 'create', 'join', 'lobby'
     const [myIndex, setMyIndex] = useState(null);
     const [serverMaxPlayers, setServerMaxPlayers] = useState(2);
     const [connectedPlayers, setConnectedPlayers] = useState(0);
+    const [isPublic, setIsPublic] = useState(true);
+    const [publicRooms, setPublicRooms] = useState([]);
     const [rematchRequestedBy, setRematchRequestedBy] = useState(null);
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    const { userName } = useGameStore();
 
-    // Persistence load
+    // Reaction State
+    const [activeReactions, setActiveReactions] = useState([]); // Array of { id, playerId, emoji }
+    const [showReactionPicker, setShowReactionPicker] = useState(false);
+    const REACTION_EMOJIS = ["😀", "😂", "😎", "😭", "😡", "🎉", "🔥", "🐍", "🪜"];
+    const reactionPickerRef = useRef(null);
+
+    useEffect(() => {
+        function handleClickOutside(event) {
+            if (reactionPickerRef.current && !reactionPickerRef.current.contains(event.target)) {
+                setShowReactionPicker(false);
+            }
+        }
+
+        if (showReactionPicker) {
+            document.addEventListener("mousedown", handleClickOutside);
+        } else {
+            document.removeEventListener("mousedown", handleClickOutside);
+        }
+        return () => {
+            document.removeEventListener("mousedown", handleClickOutside);
+        };
+    }, [showReactionPicker]);
+
+    // Persistence load and Auto-Join
     useEffect(() => {
         const loadGame = () => {
-            const saved = sessionStorage.getItem('snl_game_state');
-            if (saved) {
-                try {
-                    const parsed = JSON.parse(saved);
-                    if (parsed.gameMode !== 'online') {
-                        setPlayers(parsed.players);
-                        setPlayerCount(parsed.playerCount);
-                        setCurrentPlayerIndex(parsed.currentPlayerIndex);
-                        setDiceValue(parsed.diceValue);
-                        setGameMode(parsed.gameMode);
-                        setWinner(parsed.winner);
-                        setMoveLog(parsed.moveLog);
-                        setBoard(parsed.board);
-                    } else if (sessionStorage.getItem('active_room_id')) {
-                        // Attempt reconnect?
-                        setRoom(sessionStorage.getItem('active_room_id'));
-                        setOnlineView('join');
-                        setIsRoomJoined(false); // Wait for manual or auto trigger
-                        // We could auto-join here but it's tricky with React StrictMode double mounts.
-                        // Let's rely on user clicking join, or improve later.
-                    }
-                } catch (e) {
-                    console.error("Failed to load saved game", e);
-                }
+            // Check URL for room ID
+            const searchParams = new URLSearchParams(window.location.search);
+            const roomIdFromUrl = searchParams.get('id');
+
+            if (roomIdFromUrl) {
+                console.log("Auto-joining room from URL:", roomIdFromUrl);
+                setGameMode('online');
+                setRoom(roomIdFromUrl);
+                setOnlineView('join');
+                setTimeout(() => {
+                    joinRoom(roomIdFromUrl, 'join');
+                }, 500);
             }
         };
         loadGame();
     }, []);
 
+
+
+    // Auto-fetch Public Rooms
     useEffect(() => {
-        if (gameMode !== 'online') {
-            const stateToSave = {
-                players,
-                playerCount,
-                currentPlayerIndex,
-                diceValue,
-                gameMode,
-                winner,
-                moveLog,
-                board
-            };
-            sessionStorage.setItem('snl_game_state', JSON.stringify(stateToSave));
-            sessionStorage.removeItem('active_room_id');
-        } else if (isRoomJoined) {
-            sessionStorage.setItem('active_room_id', room);
+        if (onlineView === 'join') {
+            if (!socket.connected) socket.connect();
+            socket.emit("get_public_rooms", { gameType: 'snakeandladders' });
+            const interval = setInterval(() => {
+                socket.emit("get_public_rooms", { gameType: 'snakeandladders' });
+            }, 5000);
+            return () => clearInterval(interval);
         }
-    }, [players, playerCount, currentPlayerIndex, diceValue, gameMode, winner, moveLog, board, isRoomJoined, room]);
+    }, [onlineView]);
 
     // Socket Handlers
     useEffect(() => {
+        socket.on("public_rooms_list", (data) => {
+            setPublicRooms(data);
+        });
+
         socket.on("player_role", ({ index, maxPlayers }) => {
             setMyIndex(index);
             if (maxPlayers) setServerMaxPlayers(maxPlayers);
@@ -202,6 +219,18 @@ function SnakeAndLadders() {
             alert("A player left the game.");
         });
 
+        socket.on("receive_reaction", (data) => {
+            // data: { room, reaction, playerIndex }
+            // We use a timestamp ID to allow multiple same emojis
+            const id = Date.now() + Math.random();
+            setActiveReactions(prev => [...prev, { id, playerId: data.playerIndex + 1, emoji: data.reaction }]);
+
+            // Remove after animation
+            setTimeout(() => {
+                setActiveReactions(prev => prev.filter(r => r.id !== id));
+            }, 3000);
+        });
+
         return () => {
             socket.off("player_role");
             socket.off("room_full");
@@ -211,6 +240,7 @@ function SnakeAndLadders() {
             socket.off("rematch_accepted");
             socket.off("rematch_declined");
             socket.off("opponent_left");
+            socket.off("receive_reaction");
         }
     }, [socket, board.id]);
 
@@ -219,7 +249,7 @@ function SnakeAndLadders() {
         const handleReconnect = () => {
             if (gameMode === 'online' && room && isRoomJoined) {
                 // Re-join with the same room ID
-                socket.emit("join_room", { room, gameType: 'snakeandladders', action: 'join' });
+                socket.emit("join_room", { room, gameType: 'snakeandladders', action: 'join', userName });
                 // We don't need to specify maxPlayers here for join
             }
         };
@@ -229,7 +259,17 @@ function SnakeAndLadders() {
     }, [socket, gameMode, room, isRoomJoined]);
 
     const joinRoom = (roomIdInput, action = 'join', max = 2) => {
-        const targetRoom = roomIdInput || room;
+        let targetRoom = roomIdInput || room;
+
+        // Extract ID if URL is pasted
+        try {
+            if (targetRoom.includes('http') || targetRoom.includes('?id=')) {
+                const urlObj = new URL(targetRoom.startsWith('http') ? targetRoom : `http://dummy.com/${targetRoom}`);
+                const idParam = urlObj.searchParams.get('id');
+                if (idParam) targetRoom = idParam;
+            }
+        } catch (e) { console.log(e); }
+
         if (targetRoom !== "") {
             if (!socket.connected) socket.connect();
 
@@ -237,12 +277,27 @@ function SnakeAndLadders() {
                 room: targetRoom,
                 gameType: 'snakeandladders',
                 maxPlayers: action === 'create' ? max : undefined, // Only send max on create
-                action
+                action,
+                isPublic: action === 'create' ? isPublic : false,
+                userName
             });
             setRoom(targetRoom);
             if (action === 'create') setServerMaxPlayers(max);
             setIsRoomJoined(true); // Optimistic, error handler will revert
+
+            // Update URL
+            const url = new URL(window.location);
+            url.searchParams.set('id', targetRoom);
+            window.history.pushState({}, '', url);
         }
+    };
+
+    const [isCopied, setIsCopied] = useState(false);
+    const handleCopyLink = () => {
+        const url = window.location.href;
+        navigator.clipboard.writeText(url);
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
     };
 
     const handleLeaveRoom = () => {
@@ -253,7 +308,13 @@ function SnakeAndLadders() {
         setMyIndex(null);
         setWinner(null);
         setRematchRequestedBy(null);
+        setRematchRequestedBy(null);
         sessionStorage.removeItem('active_room_id');
+
+        // Reset URL
+        const url = new URL(window.location);
+        url.searchParams.delete('id');
+        window.history.pushState({}, '', url);
     };
 
     const requestRematch = () => {
@@ -303,10 +364,20 @@ function SnakeAndLadders() {
             setMyIndex(null);
             setIsRoomJoined(false);
             setOnlineView('menu');
+            setActiveReactions([]);
         } else {
             setOnlineView('menu'); // Reset menu view within online
             setIsRoomJoined(false);
+            setActiveReactions([]);
         }
+    };
+
+    const sendReaction = (emoji) => {
+        if (gameMode !== 'online' || !isRoomJoined) return;
+
+        // Send to server
+        socket.emit("send_reaction", { room, reaction: emoji, playerIndex: myIndex });
+        // Removed auto-close to allow spamming
     };
 
     const rollDice = async () => {
@@ -321,6 +392,9 @@ function SnakeAndLadders() {
             setTimeout(() => setIsRolling(false), 500);
             return;
         }
+
+        // Block if animation is in progress
+        if (isAnimating) return;
 
         setIsRolling(true);
 
@@ -342,16 +416,18 @@ function SnakeAndLadders() {
         movePlayer(value);
     };
 
-    const movePlayer = (steps) => {
-        const newPlayers = players.map(p => ({ ...p }));
-        const player = newPlayers[currentPlayerIndex];
+    const movePlayer = async (steps) => {
+        const player = players[currentPlayerIndex];
+        const playerIdx = currentPlayerIndex;
 
         let logMsg = `Player ${player.id} rolled ${steps}`;
         let canMove = true;
 
+        // Check if player can start
         if (!player.hasStarted) {
             if (steps === 1 || steps === 6) {
-                player.hasStarted = true;
+                // Update hasStarted flag
+                setPlayers(prev => prev.map((p, i) => i === playerIdx ? { ...p, hasStarted: true } : p));
                 logMsg += " -> Started!";
             } else {
                 logMsg += " -> Needs 1 or 6 to start.";
@@ -359,47 +435,74 @@ function SnakeAndLadders() {
             }
         }
 
-        let hasWon = false;
-        if (canMove) {
-            let nextPos = player.pos + steps;
+        setDiceValue(steps);
+        setMoveLog(prev => [logMsg, ...prev].slice(0, 5));
 
-            if (nextPos > BOARD_SIZE) {
-                nextPos = player.pos; // Stay if overshoot
-                logMsg += " -> Overshot!";
-            } else {
-                if (board.snakes[nextPos]) {
-                    logMsg += ` to ${nextPos} -> Snake! Down to ${board.snakes[nextPos]}`;
-                    nextPos = board.snakes[nextPos];
-                } else if (board.ladders[nextPos]) {
-                    logMsg += ` to ${nextPos} -> Ladder! Up to ${board.ladders[nextPos]}`;
-                    nextPos = board.ladders[nextPos];
-                } else {
-                    logMsg += ` to ${nextPos}`;
-                }
-            }
-
-            player.pos = nextPos;
-            if (nextPos === BOARD_SIZE) hasWon = true;
+        if (!canMove) {
+            // Move to next player
+            setCurrentPlayerIndex((playerIdx + 1) % players.length);
+            return;
         }
 
-        const nextPlayerIndex = (hasWon || steps === 6) ? currentPlayerIndex : (currentPlayerIndex + 1) % players.length;
+        // Calculate final position before animation
+        let startPos = player.pos;
+        let targetPos = startPos + steps;
+        let hasWon = false;
 
-        setDiceValue(steps);
-        setPlayers(newPlayers);
-        setMoveLog(prev => [logMsg, ...prev].slice(0, 5));
-        if (hasWon) setWinner(player);
-        setCurrentPlayerIndex(nextPlayerIndex);
+        if (targetPos > BOARD_SIZE) {
+            // Overshoot - don't move
+            setMoveLog(prev => [`Player ${player.id} rolled ${steps} -> Overshot!`, ...prev.slice(1)]);
+            if (steps !== 6) {
+                setCurrentPlayerIndex((playerIdx + 1) % players.length);
+            }
+            return;
+        }
+
+        // Start step-by-step animation
+        setIsAnimating(true);
+
+        // Animate through each step
+        for (let pos = startPos + 1; pos <= targetPos; pos++) {
+            await new Promise(resolve => setTimeout(resolve, 150)); // 150ms per step
+            setPlayers(prev => prev.map((p, i) => i === playerIdx ? { ...p, pos } : p));
+        }
+
+        // Check for snake/ladder at final position
+        let finalPos = targetPos;
+        if (board.snakes[targetPos]) {
+            setMoveLog(prev => [`Player ${player.id} rolled ${steps} to ${targetPos} -> Snake! Down to ${board.snakes[targetPos]}`, ...prev.slice(1)]);
+            await new Promise(resolve => setTimeout(resolve, 300)); // Pause before snake slide
+            finalPos = board.snakes[targetPos];
+            setPlayers(prev => prev.map((p, i) => i === playerIdx ? { ...p, pos: finalPos } : p));
+        } else if (board.ladders[targetPos]) {
+            setMoveLog(prev => [`Player ${player.id} rolled ${steps} to ${targetPos} -> Ladder! Up to ${board.ladders[targetPos]}`, ...prev.slice(1)]);
+            await new Promise(resolve => setTimeout(resolve, 300)); // Pause before ladder climb
+            finalPos = board.ladders[targetPos];
+            setPlayers(prev => prev.map((p, i) => i === playerIdx ? { ...p, pos: finalPos } : p));
+        }
+
+        if (finalPos === BOARD_SIZE) {
+            hasWon = true;
+            setWinner(players[playerIdx]);
+        }
+
+        setIsAnimating(false);
+
+        // Determine next player (6 = another turn, win = stay)
+        if (!hasWon && steps !== 6) {
+            setCurrentPlayerIndex((playerIdx + 1) % players.length);
+        }
     };
 
     // AI Turn effect
     useEffect(() => {
-        if (gameMode === 'pve' && currentPlayer?.isAi && !winner && !isRolling) {
+        if (gameMode === 'pve' && currentPlayer?.isAi && !winner && !isRolling && !isAnimating) {
             const timer = setTimeout(() => {
                 rollDice();
             }, 1000);
             return () => clearTimeout(timer);
         }
-    }, [currentPlayerIndex, isRolling, winner, gameMode]);
+    }, [currentPlayerIndex, isRolling, isAnimating, winner, gameMode]);
 
 
     // Board Grid Generation
@@ -536,6 +639,17 @@ function SnakeAndLadders() {
                                                     {[2, 3, 4].map(n => <button key={n} onClick={() => setServerMaxPlayers(n)} className={`flex-1 py-2 rounded-lg text-sm font-bold border transition-all ${serverMaxPlayers === n ? 'bg-green-500 border-green-500 text-white shadow-lg shadow-green-500/20' : 'border-white/10 bg-white/5 text-gray-400 hover:bg-white/10'}`}>{n}</button>)}
                                                 </div>
                                             </div>
+
+                                            <div className="flex items-center justify-between bg-black/40 p-3 rounded-xl border border-white/10">
+                                                <span className="text-gray-300 text-sm font-bold">Public Room</span>
+                                                <button
+                                                    onClick={() => setIsPublic(!isPublic)}
+                                                    className={`w-12 h-6 rounded-full p-1 transition-colors ${isPublic ? 'bg-green-500' : 'bg-gray-600'}`}
+                                                >
+                                                    <div className={`w-4 h-4 rounded-full bg-white shadow-md transition-transform ${isPublic ? 'translate-x-6' : 'translate-x-0'}`} />
+                                                </button>
+                                            </div>
+
                                             <div className="space-y-2">
                                                 <label className="text-xs text-gray-400 font-bold uppercase block">Room ID (Optional)</label>
                                                 <input type="text" placeholder="e.g. MYROOM" className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:border-green-500 outline-none font-mono shadow-inner" onChange={e => setRoom(e.target.value)} />
@@ -547,15 +661,51 @@ function SnakeAndLadders() {
                                         <div className="space-y-4">
                                             <div className="flex items-center justify-between border-b border-white/10 pb-2">
                                                 <button onClick={() => setOnlineView('menu')} className="text-gray-400 hover:text-white flex items-center gap-1 text-xs font-bold uppercase tracking-wider"><ArrowLeft size={14} /> Back</button>
-                                                <span className="text-white font-bold text-sm">JOIN ROOM</span>
+                                                <span className="text-white font-bold text-sm">BROWSE ROOMS</span>
                                             </div>
-                                            <div className="space-y-2">
-                                                <label className="text-xs text-gray-400 font-bold uppercase block">Room ID</label>
-                                                <input type="text" placeholder="Enter ID..." className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:border-blue-500 outline-none font-mono shadow-inner" onChange={e => setRoom(e.target.value)} />
+
+                                            <div className="flex gap-2">
+                                                <input type="text" placeholder="Enter Room ID" className="flex-1 bg-black/40 border border-white/20 rounded-xl px-4 py-3 text-white focus:border-blue-500 outline-none font-mono text-sm shadow-inner" onChange={(e) => setRoom(e.target.value)} />
+                                                <button onClick={() => joinRoom(room, 'join')} className="px-4 bg-blue-500 rounded-xl font-bold text-white hover:bg-blue-400 shadow-lg shadow-blue-500/20">Join</button>
                                             </div>
-                                            <button onClick={() => joinRoom(room, 'join')} className="w-full py-3 bg-blue-500 rounded-xl font-black text-white hover:bg-blue-400 shadow-lg shadow-blue-500/20 transform active:scale-95 transition-all">JOIN</button>
+
+                                            <div className="space-y-2 max-h-[200px] overflow-y-auto pr-2 custom-scrollbar">
+                                                <div className="flex justify-between items-center text-xs text-gray-500 font-bold uppercase tracking-wider">
+                                                    <span>Public Rooms</span>
+                                                    <button
+                                                        onClick={() => {
+                                                            setIsRefreshing(true);
+                                                            socket.emit("get_public_rooms", { gameType: 'snakeandladders' });
+                                                            setTimeout(() => setIsRefreshing(false), 1000);
+                                                        }}
+                                                        className={`text-blue-400 hover:text-white transition-all ${isRefreshing ? 'animate-spin' : ''}`}
+                                                    >
+                                                        <RefreshCw size={12} />
+                                                    </button>
+                                                </div>
+                                                {publicRooms.length === 0 ? (
+                                                    <div className="text-center py-8 text-gray-500 text-sm italic">No public rooms found. Create one!</div>
+                                                ) : (
+                                                    publicRooms.map(r => (
+                                                        <div key={r.id} className="flex items-center justify-between bg-white/5 p-3 rounded-xl border border-white/5 hover:border-white/20 hover:bg-white/10 transition-all group">
+                                                            <div>
+                                                                <div className="text-white font-mono font-bold">{r.id}</div>
+                                                                <div className="text-xs text-gray-400">{r.players}/{r.max} Players</div>
+                                                            </div>
+                                                            <button
+                                                                onClick={() => joinRoom(r.id, 'join')}
+                                                                className="px-3 py-1 bg-blue-500/20 text-blue-300 rounded-lg text-xs font-bold border border-blue-500/20 group-hover:bg-blue-500 group-hover:text-white transition-colors"
+                                                            >
+                                                                JOIN
+                                                            </button>
+                                                        </div>
+                                                    ))
+                                                )}
+                                            </div>
                                         </div>
                                     )}
+
+
                                 </div>
                             )}
 
@@ -567,6 +717,19 @@ function SnakeAndLadders() {
                         <div className="absolute inset-0 p-4">
                             <div className="grid grid-cols-10 grid-rows-10 w-full h-full border border-white/10 rounded-lg overflow-hidden">
                                 {renderBoard()}
+
+                                {gameMode === 'online' && connectedPlayers < serverMaxPlayers && (
+                                    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm">
+                                        <div className="text-white text-2xl font-bold mb-6 animate-pulse text-center px-4 drop-shadow-lg">
+                                            Waiting for Players...
+                                            <span className="block text-xl text-yellow-400 mt-2">({connectedPlayers}/{serverMaxPlayers})</span>
+                                        </div>
+                                        <div className="animate-spin rounded-full h-16 w-16 border-4 border-white/20 border-t-green-500 shadow-xl"></div>
+                                        <div className="mt-8 bg-white/10 px-6 py-3 rounded-full border border-white/20 backdrop-blur pointer-events-auto">
+                                            <p className="text-white font-mono font-bold tracking-wider">Room: <span className="text-green-400">{room}</span></p>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -614,9 +777,24 @@ function SnakeAndLadders() {
                         <h3 className="text-sm font-bold mb-4 text-gray-400 uppercase">Status</h3>
 
                         {gameMode === 'online' && isRoomJoined && (
-                            <div className="mb-4 p-3 bg-blue-500/20 rounded-xl border border-blue-500/30 text-center">
-                                <p className="text-blue-300 font-bold">Room: {room}</p>
-                                <PingDisplay />
+                            <div className="mb-4 p-3 bg-blue-500/20 rounded-xl border border-blue-500/30">
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2">
+                                        <Share2 size={14} className="text-blue-400" />
+                                        <span className="text-blue-300 font-bold text-xs uppercase tracking-wider">Room Code</span>
+                                    </div>
+                                    <PingDisplay />
+                                </div>
+                                <div className="flex items-center gap-2 bg-black/40 rounded-lg p-2 border border-blue-500/20">
+                                    <code className="flex-1 font-mono text-center font-bold text-lg tracking-widest text-white">{room}</code>
+                                    <button
+                                        onClick={handleCopyLink}
+                                        className="p-2 hover:bg-white/10 rounded-lg transition-colors text-blue-400 relative group"
+                                        title="Copy Link"
+                                    >
+                                        {isCopied ? <Check size={16} /> : <Copy size={16} />}
+                                    </button>
+                                </div>
                             </div>
                         )}
 
@@ -625,12 +803,93 @@ function SnakeAndLadders() {
                                 <div key={p.id} className={`flex justify-between items-center p-3 rounded-xl border transition-all ${currentPlayerIndex === i ? `${p.config.light} ${p.config.border}` : 'border-white/5 bg-white/5 opacity-60'}`}>
                                     <div className="flex items-center gap-3">
                                         <div className={`w-3 h-3 rounded-full ${p.config.light.replace('/20', '')} shadow-[0_0_8px_current]`} />
-                                        <span className={`font-bold ${p.config.text}`}>
-                                            {gameMode === 'pve' && p.isAi ? 'AI Opponent' : `Player ${p.id}`}
-                                            {gameMode === 'online' && myIndex === i ? ' (You)' : ''}
-                                        </span>
+                                        {editingPlayerId === p.id && gameMode !== 'online' ? (
+                                            <input
+                                                autoFocus
+                                                className={`bg-black/40 border border-white/20 rounded px-1 min-w-[80px] text-sm focus:outline-none ${p.config.text} border-current`}
+                                                value={p.name || (i === 0 && userName ? userName : `Player ${p.id}`)}
+                                                onChange={(e) => {
+                                                    const newName = e.target.value;
+                                                    setPlayers(prev => prev.map(p2 => p2.id === p.id ? { ...p2, name: newName } : p2));
+                                                }}
+                                                onBlur={() => setEditingPlayerId(null)}
+                                                onKeyDown={(e) => e.key === 'Enter' && setEditingPlayerId(null)}
+                                            />
+                                        ) : (
+                                            <div className="flex items-center gap-1 group/name">
+                                                <span className={`font-bold ${p.config.text}`}>
+                                                    {gameMode === 'pve' && p.isAi ? 'AI Opponent' : (p.name || ((gameMode === 'online' ? myIndex === i : i === 0) && userName ? userName : `Player ${p.id}`))}
+                                                    {gameMode === 'online' && myIndex === i ? ' (You)' : ''}
+                                                </span>
+                                                {gameMode === 'pvp' && (
+                                                    <button
+                                                        onClick={() => setEditingPlayerId(p.id)}
+                                                        className="p-1 hover:bg-white/10 rounded transition-colors"
+                                                    >
+                                                        <Pencil size={14} className="text-gray-500 hover:text-white" />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        )}
                                     </div>
                                     <span className="font-mono text-white text-sm font-bold">Pos: {p.pos}</span>
+
+                                    {/* Action Button for ME */}
+                                    {gameMode === 'online' && myIndex === i && (
+                                        <div className="relative">
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); setShowReactionPicker(!showReactionPicker); }}
+                                                className="w-6 h-6 hover:bg-white/10 rounded-full flex items-center justify-center transition-colors text-yellow-400/50 hover:text-yellow-400"
+                                            >
+                                                <Smile size={14} />
+                                            </button>
+
+                                            <AnimatePresence>
+                                                {showReactionPicker && (
+                                                    <motion.div
+                                                        ref={reactionPickerRef}
+                                                        initial={{ scale: 0, opacity: 0 }}
+                                                        animate={{ scale: 1, opacity: 1 }}
+                                                        exit={{ scale: 0, opacity: 0 }}
+                                                        className="absolute right-0 top-full mt-2 bg-[#222] border border-white/20 rounded-xl p-2 shadow-xl grid grid-cols-3 gap-1 w-[120px] z-50 pointer-events-auto origin-top-right"
+                                                        onClick={(e) => e.stopPropagation()}
+                                                    >
+                                                        {REACTION_EMOJIS.map(emoji => (
+                                                            <button
+                                                                key={emoji}
+                                                                onClick={() => sendReaction(emoji)}
+                                                                className="text-xl p-1 hover:bg-white/10 rounded cursor-pointer transition-colors transform hover:scale-110 active:scale-95"
+                                                            >
+                                                                {emoji}
+                                                            </button>
+                                                        ))}
+                                                    </motion.div>
+                                                )}
+                                            </AnimatePresence>
+                                        </div>
+                                    )}
+
+                                    {/* Reaction Display Area */}
+                                    <AnimatePresence>
+                                        {activeReactions.filter(r => r.playerId === p.id).map(r => (
+                                            <motion.div
+                                                key={r.id}
+                                                initial={{ y: 0, opacity: 0, scale: 0.9 }}
+                                                animate={{
+                                                    y: -120,
+                                                    x: [0, (Math.random() - 0.5) * 80, (Math.random() - 0.5) * 80, 0],
+                                                    opacity: [0, 1, 1, 0],
+                                                    scale: [0.9, 1.1, 1]
+                                                }}
+                                                exit={{ opacity: 0 }}
+                                                transition={{ duration: 3, ease: "easeInOut" }}
+                                                className="absolute left-1/2 top-1/2 -translate-x-1/2 pointer-events-none text-4xl z-50"
+                                            >
+                                                {r.emoji}
+                                            </motion.div>
+                                        ))}
+                                    </AnimatePresence>
+
                                 </div>
                             ))}
                         </div>
@@ -645,10 +904,10 @@ function SnakeAndLadders() {
                         </div>
                     </div>
                 </div>
-            </div>
+            </div >
 
             {/* Win Overlay */}
-            <AnimatePresence>
+            < AnimatePresence >
                 {winner && (
                     <motion.div
                         initial={{ opacity: 0 }}
@@ -696,10 +955,11 @@ function SnakeAndLadders() {
                             )}
                         </motion.div>
                     </motion.div>
-                )}
-            </AnimatePresence>
+                )
+                }
+            </AnimatePresence >
             <VoiceChat room={room} isRoomJoined={gameMode === 'online' && isRoomJoined} />
-        </div>
+        </div >
     );
 }
 

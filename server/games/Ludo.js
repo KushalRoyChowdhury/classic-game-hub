@@ -38,9 +38,12 @@ class Ludo {
         return this.getState();
     }
 
-    addPlayer(socketId) {
+    addPlayer(socketId, name = null) {
         const existingIndex = this.seats.indexOf(socketId);
-        if (existingIndex !== -1) return existingIndex;
+        if (existingIndex !== -1) {
+            if (name) this.players[existingIndex].name = name;
+            return existingIndex;
+        }
 
         const activeIndices = this.maxPlayers === 2 ? [0, 2] :
             this.maxPlayers === 3 ? [0, 1, 2] :
@@ -52,6 +55,7 @@ class Ludo {
         for (let i of activeIndices) {
             if (this.seats[i] === null) {
                 this.seats[i] = socketId;
+                this.players[i].name = name || this.players[i].color;
                 return i;
             }
         }
@@ -62,6 +66,7 @@ class Ludo {
         const index = this.seats.indexOf(socketId);
         if (index !== -1) {
             this.seats[index] = null;
+            this.players[index].name = null;
         }
     }
 

@@ -51,14 +51,18 @@ class SnakeAndLadders {
         this.diceValue = null;
     }
 
-    addPlayer(socketId) {
+    addPlayer(socketId, name = null) {
         // Idempotency
         const existingIndex = this.seats.indexOf(socketId);
-        if (existingIndex !== -1) return existingIndex;
+        if (existingIndex !== -1) {
+            if (name) this.players[existingIndex].name = name;
+            return existingIndex;
+        }
 
         const seatIndex = this.seats.indexOf(null);
         if (seatIndex === -1) return -1;
         this.seats[seatIndex] = socketId;
+        this.players[seatIndex].name = name || `Player ${seatIndex + 1}`;
         return seatIndex;
     }
 
@@ -66,6 +70,7 @@ class SnakeAndLadders {
         const index = this.seats.indexOf(socketId);
         if (index !== -1) {
             this.seats[index] = null;
+            this.players[index].name = null; // Optional: revert to default or leave null
         }
     }
 

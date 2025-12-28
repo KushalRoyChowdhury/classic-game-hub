@@ -23,12 +23,14 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
     // UI Refs
     const remoteAudioRefs = useRef({}); // Map<callId, HTMLAudioElement>
+    const panelRef = useRef(null); // For click-outside detection
+
+    const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
 
     // --- Actions ---
     const joinVoice = async () => {
         if (!room) return;
         try {
-            console.log("[VoiceChat] Getting User Media...");
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
             // Default Mute
@@ -47,7 +49,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
             });
 
             peer.on('open', (id) => {
-                console.log('[VoiceChat] My peer ID is: ' + id);
                 myPeerId.current = id;
                 // Announce to room via Socket
                 socket.emit('voice_peer_join', { room, peerId: id });
@@ -56,7 +57,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
             // Handle Incoming Calls
             peer.on('call', (call) => {
-                console.log("[VoiceChat] Incoming call from:", call.peer);
                 call.answer(stream); // Answer with our stream
                 peersCalls.current.push(call);
 
@@ -86,7 +86,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
     const connectToNewUser = (userId, remotePeerId) => {
         if (!peerInstance.current) return;
-        console.log("[VoiceChat] Calling new user:", remotePeerId);
 
         const call = peerInstance.current.call(remotePeerId, streamRef.current);
         if (!call) return; // Happens if connection not ready
@@ -110,8 +109,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
     const addRemoteAudio = (id, stream) => {
         const existingInfo = remoteAudioRefs.current[id];
         if (existingInfo) return;
-
-        console.log("[VoiceChat] Adding audio for:", id);
 
         // Update UI list for visuals
         setRemotePeerStatus(prev => ({ ...prev, [id]: { isMicMuted: true } }));
@@ -140,7 +137,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
     };
 
     const removeRemoteAudio = (id) => {
-        console.log("[VoiceChat] Removing audio for:", id);
         const audio = remoteAudioRefs.current[id];
         if (audio) {
             audio.pause();
@@ -189,7 +185,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
         // When WE join, server sends list of existing peers
         socket.on('all_voice_peers', (peersList) => {
-            console.log("[VoiceChat] Existing peers:", peersList);
             peersList.forEach(p => {
                 if (p.peerId !== myPeerId.current) {
                     connectToNewUser(null, p.peerId);
@@ -199,15 +194,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
 
         // When SOMEONE ELSE joins
         socket.on('user_joined_voice_peer', ({ peerId }) => {
-            console.log("[VoiceChat] User joined with PeerJS ID:", peerId);
-            // Depending on mesh strategy. Mesh = everyone calls everyone.
-            // If new user calls us, we wait. If we call them, we do it here.
-            // PeerJS best practice: Newcomer calls existing users? 
-            // Or Existing users call newcomer?
-            // Sending 'all_voice_peers' to newcomer is easier, so newcomer calls everyone.
-            // See server implementation below. Assuming new user calls us.
-            // Actually, wait for 'call' event is better for existing users.
-            // BUT, if we want to show them in UI before they call?
             setRemotePeerStatus(prev => ({ ...prev, [peerId]: { isMicMuted: true } }));
         });
 
@@ -216,9 +202,6 @@ const VoiceChat = ({ room, isRoomJoined }) => {
         });
 
         socket.on("voice_status_update", ({ peerId, status }) => {
-            // We need to map socket ID to Peer ID? 
-            // Or just use PeerID everywhere for voice.
-            // Let's assume status update sends peerId now.
             if (peerId) setRemotePeerStatus(prev => ({ ...prev, [peerId]: status }));
         });
 
@@ -254,25 +237,65 @@ const VoiceChat = ({ room, isRoomJoined }) => {
     }, [isRoomJoined]);
     useEffect(() => () => leaveVoice(), []);
 
+    // Click outside to minimize
+    useEffect(() => {
+        const handleClickOutside = (e) => {
+            if (panelRef.current && !panelRef.current.contains(e.target) && !isMinimized && isVoiceJoined) {
+                setIsMinimized(true);
+            }
+        };
+        if (isVoiceJoined && !isMinimized) {
+            document.addEventListener('mousedown', handleClickOutside);
+        }
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, [isVoiceJoined, isMinimized]);
+
     // --- Render ---
     if (!isRoomJoined) return null;
-
-    const SPRING_TRANSITION = { type: "spring", stiffness: 5000, damping: 300 };
 
     return (
         <div className="fixed bottom-4 left-4 z-[9000] flex flex-col gap-2">
             <AnimatePresence mode="wait">
                 {isVoiceJoined && (
                     isMinimized ? (
-                        <motion.button key="min" layoutId="voice-panel" onClick={() => setIsMinimized(false)}
-                            className="p-3 rounded-full shadow-lg border-2 backdrop-blur-md flex items-center justify-center bg-black/50 border-green-500/50">
-                            {isMicMuted ? <MicOff size={24} className="text-red-400" /> : <Mic size={24} className="text-green-400" />}
+                        <motion.button
+                            key="min"
+                            layoutId="voice-panel"
+                            layout
+                            onClick={() => setIsMinimized(false)}
+                            className="relative p-3 rounded-full shadow-lg border-2 backdrop-blur-md flex items-center justify-center bg-black/70 border-green-500/50"
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.98 }}
+                            transition={SPRING_TRANSITION}
+                        >
+                            {/* Pulsing ring when unmuted */}
+                            {!isMicMuted && (
+                                <motion.div
+                                    className="absolute inset-0 rounded-full border-2 border-green-400"
+                                    animate={{ scale: [1, 1.4], opacity: [0.6, 0] }}
+                                    transition={{ duration: 2, repeat: Infinity, ease: "easeOut" }}
+                                />
+                            )}
+                            {isMicMuted ? <MicOff size={24} className="text-red-400" /> : <Mic size={24} className="text-green-400 drop-shadow-[0_0_8px_#4ade80]" />}
                         </motion.button>
                     ) : (
-                        <motion.div key="exp" layoutId="voice-panel" className="bg-[#1a1a1a]/95 backdrop-blur-xl border border-white/10 p-4 rounded-2xl shadow-2xl w-64">
-                            <div className="flex justify-between items-center mb-3 border-b border-white/10 pb-2">
+                        <motion.div
+                            key="exp"
+                            ref={panelRef}
+                            layoutId="voice-panel"
+                            layout
+                            className="bg-[#0d0d0d]/95 backdrop-blur-xl border border-green-500/30 p-4 rounded-2xl shadow-[0_0_30px_rgba(34,197,94,0.15)] w-64"
+                            transition={SPRING_TRANSITION}
+                        >
+                            <div className="flex justify-between items-center mb-3 border-b border-green-500/20 pb-2">
                                 <span className="font-bold text-xs uppercase tracking-wider text-green-400 flex items-center gap-2">
-                                    <Radio size={12} className="animate-pulse" /> PeerJS Voice
+                                    <motion.div
+                                        animate={{ scale: [1, 1.15, 1] }}
+                                        transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+                                    >
+                                        <Radio size={12} className="text-green-400" />
+                                    </motion.div>
+                                    Voice Chat
                                 </span>
                                 <div className="flex gap-2">
                                     <button onClick={() => setIsMinimized(true)}><X size={16} className="text-gray-400" /></button>
@@ -308,10 +331,28 @@ const VoiceChat = ({ room, isRoomJoined }) => {
                 )}
             </AnimatePresence>
             {!isVoiceJoined && isRoomJoined && (
-                <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={joinVoice}
-                    className="bg-green-600/90 text-white p-3 rounded-full shadow-lg border-2 border-green-400/30 backdrop-blur-sm flex items-center justify-center">
-                    <Phone size={24} />
-                    <span className="sr-only">Join PeerJS</span>
+                <motion.button
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={joinVoice}
+                    initial={{ scale: 0.8, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ type: "spring", stiffness: 200, damping: 20 }}
+                    className="relative bg-gradient-to-br from-green-600 to-emerald-700 text-white p-4 rounded-full shadow-[0_0_20px_rgba(34,197,94,0.4)] border-2 border-green-400/40 backdrop-blur-sm flex items-center justify-center group"
+                >
+                    {/* Outer pulsing ring - smooth */}
+                    <motion.div
+                        className="absolute inset-0 rounded-full border-2 border-green-400/50"
+                        animate={{ scale: [1, 1.5], opacity: [0.5, 0] }}
+                        transition={{ duration: 2.5, repeat: Infinity, ease: "easeOut" }}
+                    />
+                    <motion.div
+                        className="absolute inset-0 rounded-full border border-green-400/20"
+                        animate={{ scale: [1, 1.8], opacity: [0.3, 0] }}
+                        transition={{ duration: 2.5, repeat: Infinity, ease: "easeOut", delay: 0.5 }}
+                    />
+                    <Phone size={24} className="group-hover:rotate-12 transition-transform duration-300" />
+                    <span className="sr-only">Join Voice Chat</span>
                 </motion.button>
             )}
         </div>
@@ -352,7 +393,29 @@ const LocalActivityIndicator = ({ stream, isMicMuted }) => {
     }, [stream, isMicMuted]);
 
     const isTalking = volume > 10;
-    return <div className={`w-2 h-2 rounded-full transition-all duration-150 ${isTalking ? 'bg-green-400 scale-125 shadow-[0_0_8px_#4ade80]' : 'bg-gray-600'}`} />;
+    const normalizedVolume = Math.min(volume / 50, 1); // Normalize to 0-1
+
+    return (
+        <div className="flex items-center gap-0.5">
+            {[0.15, 0.35, 0.55, 0.75].map((threshold, i) => (
+                <motion.div
+                    key={i}
+                    className="w-1 rounded-full bg-green-500"
+                    animate={{
+                        height: normalizedVolume > threshold ? 4 + (normalizedVolume - threshold) * 12 : 4,
+                        opacity: normalizedVolume > threshold ? 0.6 + normalizedVolume * 0.4 : 0.25
+                    }}
+                    transition={{
+                        type: "spring",
+                        stiffness: 400,
+                        damping: 15,
+                        mass: 0.5
+                    }}
+                    style={{ height: 4 }}
+                />
+            ))}
+        </div>
+    );
 };
 
 const RemotePeer = ({ peerId, status, isSpeakerMuted }) => {
@@ -411,14 +474,49 @@ const RemotePeer = ({ peerId, status, isSpeakerMuted }) => {
 
 
     const isTalking = volume > 10;
+    const normalizedVolume = Math.min(volume / 50, 1);
+
     return (
-        <div className="flex items-center justify-between p-2 rounded-lg bg-black/40 border border-white/5">
+        <motion.div
+            className={`flex items-center justify-between p-2 rounded-lg border ${isTalking ? 'bg-blue-500/10 border-blue-500/30' : 'bg-black/40 border-white/5'}`}
+            animate={{ scale: isTalking ? 1.015 : 1 }}
+            transition={{ type: "spring", stiffness: 300, damping: 20 }}
+        >
             <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full transition-all duration-150 ${isTalking ? 'bg-blue-400 scale-125 shadow-[0_0_8px_#3b82f6]' : 'bg-blue-800'}`} />
-                <span className="text-xs font-bold text-gray-400">Player {peerId.substr(0, 4)}</span>
+                {/* Audio bars - smooth spring */}
+                <div className="flex items-center gap-0.5">
+                    {[0.15, 0.35, 0.55, 0.75].map((threshold, i) => (
+                        <motion.div
+                            key={i}
+                            className="w-1 rounded-full bg-blue-400"
+                            animate={{
+                                height: normalizedVolume > threshold ? 4 + (normalizedVolume - threshold) * 10 : 4,
+                                opacity: normalizedVolume > threshold ? 0.6 + normalizedVolume * 0.4 : 0.25
+                            }}
+                            transition={{
+                                type: "spring",
+                                stiffness: 400,
+                                damping: 15,
+                                mass: 0.5
+                            }}
+                            style={{ height: 4 }}
+                        />
+                    ))}
+                </div>
+                <span className={`text-xs font-bold transition-colors duration-300 ${isTalking ? 'text-blue-300' : 'text-gray-400'}`}>
+                    Player {peerId.substr(0, 4)}
+                </span>
             </div>
-            {status?.isMicMuted ? <MicOff size={14} className="text-red-500/50" /> : <Mic size={14} className="text-green-500/50" />}
-        </div>
+            {status?.isMicMuted ?
+                <MicOff size={14} className="text-red-500/50" /> :
+                <motion.div
+                    animate={{ scale: isTalking ? 1.15 : 1 }}
+                    transition={{ type: "spring", stiffness: 300, damping: 15 }}
+                >
+                    <Mic size={14} className="text-green-400" />
+                </motion.div>
+            }
+        </motion.div>
     );
 };
 

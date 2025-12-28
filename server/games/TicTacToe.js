@@ -12,12 +12,17 @@ class TicTacToe {
         this.winner = null;
         this.isDraw = false;
         this.seats = [null, null]; // [PlayerX_SocketId, PlayerO_SocketId]
+        this.playerNames = [null, null]; // [PlayerX_Name, PlayerO_Name]
     }
 
-    addPlayer(socketId) {
+    addPlayer(socketId, name = null) {
         // Idempotency: If this socket is already in a seat, return valid index
         const existingIndex = this.seats.indexOf(socketId);
-        if (existingIndex !== -1) return existingIndex;
+        if (existingIndex !== -1) {
+            // Update name if reconnecting or just in case
+            if (name) this.playerNames[existingIndex] = name;
+            return existingIndex;
+        }
 
         // If room is empty (all null), ensure clean state
         if (this.seats.every(s => s === null)) {
@@ -27,6 +32,7 @@ class TicTacToe {
         const seatIndex = this.seats.indexOf(null);
         if (seatIndex === -1) return -1; // Full
         this.seats[seatIndex] = socketId;
+        this.playerNames[seatIndex] = name || `Player ${seatIndex === 0 ? 'X' : 'O'}`;
         return seatIndex; // 0 or 1
     }
 
@@ -34,6 +40,7 @@ class TicTacToe {
         const index = this.seats.indexOf(socketId);
         if (index !== -1) {
             this.seats[index] = null;
+            this.playerNames[index] = null;
             // Last Man Standing Win
             // If game is in progress (no winner, not disabled), declare other player winner
             if (!this.winner && !this.isDraw) {
@@ -84,6 +91,7 @@ class TicTacToe {
         this.xIsNext = true;
         this.winner = null;
         this.isDraw = false;
+        // Keep seats and names
         return this.getState();
     }
 
@@ -94,7 +102,8 @@ class TicTacToe {
             xIsNext: this.xIsNext,
             winner: this.winner,
             isDraw: this.isDraw,
-            seats: this.seats
+            seats: this.seats,
+            playerNames: this.playerNames
         };
     }
 }

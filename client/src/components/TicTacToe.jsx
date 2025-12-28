@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { RefreshCw, RotateCcw, User, Bot, Zap, Brain, Swords, Globe, LogIn, MonitorPlay, Users, ArrowLeft, LogOut } from 'lucide-react'
+import { RefreshCw, RotateCcw, User, Bot, Zap, Brain, Swords, Globe, LogIn, MonitorPlay, Users, ArrowLeft, LogOut, Copy, Check, Share2, Smile, X, Pencil } from 'lucide-react'
 import Board from './Board'
 import History from './History'
 import { checkWinner, filterHistory, getRandomMove, getBestMove } from '../utils/gameUtils'
@@ -9,6 +9,7 @@ import Toast, { useToast } from './Toast'
 import PingDisplay from './PingDisplay'
 import ConnectionStatus from './ConnectionStatus'
 import VoiceChat from './VoiceChat'
+import useGameStore from '../store/gameStore'
 
 function TicTacToe() {
     const [squares, setSquares] = useState(Array(9).fill(null))
@@ -17,89 +18,120 @@ function TicTacToe() {
     const [isLoaded, setIsLoaded] = useState(false)
     const [gameMode, setGameMode] = useState('pvp') // 'pvp', 'pve', 'online'
     const [difficulty, setDifficulty] = useState('low')
+    const { userName } = useGameStore()
+    const [playerNames, setPlayerNames] = useState([null, null]) // [NameX, NameO]
+    const [localNames, setLocalNames] = useState({ X: '', O: '' })
+    const [editingName, setEditingName] = useState(null) // 'X' or 'O' or null
 
     // Online Config
     const [room, setRoom] = useState("");
     const [isRoomJoined, setIsRoomJoined] = useState(false);
+    const [isPublic, setIsPublic] = useState(true);
+    const [publicRooms, setPublicRooms] = useState([]);
     const [mySymbol, setMySymbol] = useState(null);
-    const [onlineView, setOnlineView] = useState('menu'); // 'menu', 'join', 'create'
+    const [onlineView, setOnlineView] = useState('menu'); // 'menu', 'join', 'create', 'lobby'
+
+    // Reconnect Logic - Use refs to access latest state in the callback without re-binding
+    const roomRef = useRef(room);
+    const gameModeRef = useRef(gameMode);
+    const isRoomJoinedRef = useRef(isRoomJoined);
+
+    useEffect(() => {
+        roomRef.current = room;
+        gameModeRef.current = gameMode;
+        isRoomJoinedRef.current = isRoomJoined;
+    }, [room, gameMode, isRoomJoined]);
+
+    useEffect(() => {
+        const handleReconnect = () => {
+            const r = roomRef.current;
+            const gm = gameModeRef.current;
+            const joined = isRoomJoinedRef.current;
+
+            if (gm === 'online' && r && joined) {
+                console.log("Socket reconnected, re-joining room:", r);
+                socket.emit("join_room", { room: r, gameType: 'tictactoe', action: 'join' });
+                addToast("Reconnecting...", "", "info");
+            }
+        };
+
+        socket.on("connect", handleReconnect);
+        return () => socket.off("connect", handleReconnect);
+    }, [socket]); // Only bind once
 
     // Rematch State
     const [rematchRequestedBy, setRematchRequestedBy] = useState(null);
     const [serverWinner, setServerWinner] = useState(null);
     const [serverIsDraw, setServerIsDraw] = useState(false);
+    const [isRefreshing, setIsRefreshing] = useState(false);
     const [opponentPresent, setOpponentPresent] = useState(false);
+
+    // Reaction State
+    const [activeReactions, setActiveReactions] = useState([]); // Array of { id, playerId, emoji }
+    const [showReactionPicker, setShowReactionPicker] = useState(false);
+    const REACTION_EMOJIS = ["😀", "😂", "😎", "😭", "😡", "🎉", "🔥", "❌", "⭕"];
+    const reactionPickerRef = useRef(null);
+
+    useEffect(() => {
+        function handleClickOutside(event) {
+            if (reactionPickerRef.current && !reactionPickerRef.current.contains(event.target)) {
+                setShowReactionPicker(false);
+            }
+        }
+
+        if (showReactionPicker) {
+            document.addEventListener("mousedown", handleClickOutside);
+        } else {
+            document.removeEventListener("mousedown", handleClickOutside);
+        }
+        return () => {
+            document.removeEventListener("mousedown", handleClickOutside);
+        };
+    }, [showReactionPicker]);
 
     // Toast Hook
     const { toasts, addToast, removeToast } = useToast();
 
-    // Load history from local storage on mount
+    // Load history and Handle Auto-Join
     useEffect(() => {
         const savedHistory = localStorage.getItem('tic-tac-toe-history')
         if (savedHistory) {
             setHistory(filterHistory(JSON.parse(savedHistory), 3))
         }
 
-        // Load Game State
-        const savedState = sessionStorage.getItem('ttt_game_state');
-        if (savedState) {
-            try {
-                const parsed = JSON.parse(savedState);
-                if (parsed.gameMode !== 'online') {
-                    setSquares(parsed.squares);
-                    setXIsNext(parsed.xIsNext);
-                    setGameMode(parsed.gameMode);
-                    setDifficulty(parsed.difficulty);
-                } else {
-                    // Try to restore online state?
-                    // User requested auto-restore room
-                    const savedRoom = sessionStorage.getItem('active_room_id');
-                    if (savedRoom) {
-                        setGameMode('online');
-                        setRoom(savedRoom);
-                        // Trigger join attempt in separate effect or here? 
-                        // Better to trigger via func or separate flag to avoid side-effects in mount
-                        // Let's set a flag or just call join immediately if connection ready (it won't be)
-                        // Socket connects on import usually, checking connection:
-                        setTimeout(() => {
-                            if (socket.connected || !socket.connected) { // Try anyway
-                                joinRoom(savedRoom, 'join');
-                            }
-                        }, 500);
-                    }
-                }
-            } catch (e) {
-                console.error("Failed to load TTT state", e);
-            }
+        // Check URL for room ID
+        const searchParams = new URLSearchParams(window.location.search);
+        const roomIdFromUrl = searchParams.get('id');
+
+        if (roomIdFromUrl) {
+            console.log("Auto-joining room from URL:", roomIdFromUrl);
+            setGameMode('online');
+            setRoom(roomIdFromUrl);
+            // Slight delay to ensure socket connect
+            setTimeout(() => {
+                joinRoom(roomIdFromUrl, 'join');
+            }, 500);
+            setOnlineView('join'); // Start in join view to avoid jarring transition
         }
 
         setIsLoaded(true)
     }, [])
 
-    // Session Persistence
-    useEffect(() => {
-        if (gameMode !== 'online') {
-            const stateToSave = {
-                squares,
-                xIsNext,
-                gameMode,
-                difficulty
-            };
-            sessionStorage.setItem('ttt_game_state', JSON.stringify(stateToSave));
-            sessionStorage.removeItem('active_room_id');
-        } else if (isRoomJoined) {
-            sessionStorage.setItem('active_room_id', room);
-            // Save specific online state if needed? Not strictly required if server syncs
-        }
-    }, [squares, xIsNext, gameMode, difficulty, isRoomJoined, room]);
+
 
     // Socket listeners
     useEffect(() => {
         socket.on("receive_message", (data) => {
-            if (data.squares) setSquares(data.squares);
+            if (data.squares) {
+                setSquares(data.squares);
+            }
             if (data.xIsNext !== undefined) setXIsNext(data.xIsNext);
             if (data.winner !== undefined) setServerWinner(data.winner);
             if (data.isDraw !== undefined) setServerIsDraw(data.isDraw);
+            // Handle playerNames
+            if (data.playerNames) {
+                setPlayerNames(data.playerNames);
+            }
             if (data.seats) {
                 // Check if both seats are filled (non-null)
                 // Note: seats is [p1, p2]. If one is null, opponent missing.
@@ -122,7 +154,7 @@ function TicTacToe() {
             alert(msg);
             setIsRoomJoined(false);
             setOnlineView('menu');
-            sessionStorage.removeItem('active_room_id');
+            setOnlineView('menu');
         });
 
         socket.on("rematch_requested", () => {
@@ -148,6 +180,25 @@ function TicTacToe() {
             addToast(`Player ${role} Joined`, "", "success");
         });
 
+        socket.on("public_rooms_list", (data) => {
+            setPublicRooms(data);
+        });
+
+        socket.on("receive_reaction", (data) => {
+            // data: { room, reaction, playerIndex }
+            // For TTT, playerIndex might be symbol? Or index. 
+            // In Server: seatIndex 0=X, 1=O.
+            const id = Date.now() + Math.random();
+            const symbol = data.playerIndex === 0 ? 'X' : (data.playerIndex === 1 ? 'O' : '?');
+
+            setActiveReactions(prev => [...prev, { id, symbol, emoji: data.reaction }]);
+
+            // Remove after animation
+            setTimeout(() => {
+                setActiveReactions(prev => prev.filter(r => r.id !== id));
+            }, 3000);
+        });
+
         return () => {
             socket.off("receive_message");
             socket.off("player_role");
@@ -158,37 +209,65 @@ function TicTacToe() {
             socket.off("rematch_declined");
             socket.off("opponent_left");
             socket.off("user_joined");
+            socket.off("public_rooms_list");
+            socket.off("receive_reaction");
         }
     }, [socket]);
 
-    // Reconnect Logic
-    useEffect(() => {
-        const handleReconnect = () => {
-            if (gameMode === 'online' && room && isRoomJoined) {
-                // Re-join with the same room ID
-                // Note: If server restarted, this will trigger "Room does not exist" error, which correctly exits.
-                socket.emit("join_room", { room, gameType: 'tictactoe', action: 'join' });
-                addToast("Reconnecting to Room...", "", "info");
-            }
-        };
+    // Old problematic reconnect logic removed
+    // New logic handled via refs above
 
-        socket.on("connect", handleReconnect);
-        return () => socket.off("connect", handleReconnect);
-    }, [socket, gameMode, room, isRoomJoined]);
+    // Auto-fetch Public Rooms
+    useEffect(() => {
+        if (onlineView === 'join') {
+            if (!socket.connected) socket.connect();
+            socket.emit("get_public_rooms", { gameType: 'tictactoe' });
+            const interval = setInterval(() => {
+                socket.emit("get_public_rooms", { gameType: 'tictactoe' });
+            }, 5000);
+            return () => clearInterval(interval);
+        }
+    }, [onlineView]);
 
     const joinRoom = (roomIdInput, action = 'join') => {
-        const targetRoom = roomIdInput || room;
+        let targetRoom = roomIdInput || room;
+
+        // Extract ID if URL is pasted
+        try {
+            // Basic check if it looks like a URL
+            if (targetRoom.includes('http') || targetRoom.includes('?id=')) {
+                const urlObj = new URL(targetRoom.startsWith('http') ? targetRoom : `http://dummy.com/${targetRoom}`);
+                const idParam = urlObj.searchParams.get('id');
+                if (idParam) targetRoom = idParam;
+            }
+        } catch (e) {
+            console.log("Input parsing error, using raw:", e);
+        }
+
         if (targetRoom !== "") {
             if (!socket.connected) socket.connect();
-            // action: 'create' or 'join'
-            socket.emit("join_room", { room: targetRoom, gameType: 'tictactoe', action });
+
+            socket.emit("join_room", { room: targetRoom, gameType: 'tictactoe', action, isPublic: action === 'create' ? isPublic : false, userName });
+            // Only set room state if creating/joining actually sends event? 
+            // We should assume success or wait for event? 
+            // Existing logic sets it immediately.
             setRoom(targetRoom);
-            // We assume success until error_message? 
-            // Better to set isRoomJoined AFTER success event? 
-            // Current server emits "player_role" or "receive_message" on success.
-            // Let's optimistic update, error handler will revert.
             setIsRoomJoined(true);
+            if (action === 'create') setMySymbol('X'); // Creator is X
+
+            // Update URL
+            const url = new URL(window.location);
+            url.searchParams.set('id', targetRoom);
+            window.history.pushState({}, '', url);
         }
+    };
+
+    const [isCopied, setIsCopied] = useState(false);
+    const handleCopyLink = () => {
+        const url = window.location.href;
+        navigator.clipboard.writeText(url);
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
     };
 
     const requestRematch = () => {
@@ -205,7 +284,22 @@ function TicTacToe() {
         setServerWinner(null);
         setServerIsDraw(false);
         setOpponentPresent(false);
-        sessionStorage.removeItem('active_room_id');
+        setActiveReactions([]);
+
+        const url = new URL(window.location);
+        url.searchParams.delete('id');
+        window.history.pushState({}, '', url);
+    };
+
+    const sendReaction = (emoji) => {
+        if (gameMode !== 'online' || !isRoomJoined) return;
+
+        // Determine my index
+        const index = mySymbol === 'X' ? 0 : 1;
+
+        // Send to server
+        socket.emit("send_reaction", { room, reaction: emoji, playerIndex: index });
+        // Removed auto-close to allow spamming
     };
 
     const respondRematch = (accept) => {
@@ -243,8 +337,8 @@ function TicTacToe() {
             const moveIndex = nextSquares.findIndex((val, i) => val !== squares[i]);
             if (moveIndex !== -1) {
                 socket.emit("make_move", { room, index: moveIndex });
+                return;
             }
-            return;
         }
 
         setSquares(nextSquares)
@@ -396,9 +490,20 @@ function TicTacToe() {
                                                 <button onClick={() => setOnlineView('menu')} className="text-gray-400 hover:text-white flex items-center gap-1 text-xs font-bold uppercase tracking-wider"><ArrowLeft size={14} /> Back</button>
                                                 <span className="text-white font-bold text-sm">CREATE ROOM</span>
                                             </div>
-                                            <div className="flex gap-2">
-                                                <input type="text" placeholder="ID (Optional)" className="flex-1 bg-black/40 border border-white/20 rounded-xl px-4 py-3 text-white focus:border-green-500 outline-none font-mono text-sm shadow-inner" onChange={(e) => setRoom(e.target.value)} />
-                                                <button onClick={() => joinRoom(room || Math.random().toString(36).substring(2, 7), 'create')} className="px-6 bg-green-500 rounded-xl font-bold text-white hover:bg-green-400 shadow-lg shadow-green-500/20">Create</button>
+                                            <div className="flex flex-col gap-3">
+                                                <input type="text" placeholder="Room ID (Optional)" className="flex-1 bg-black/40 border border-white/20 rounded-xl px-4 py-3 text-white focus:border-green-500 outline-none font-mono text-sm shadow-inner" onChange={(e) => setRoom(e.target.value)} />
+
+                                                <div className="flex items-center justify-between bg-black/40 p-3 rounded-xl border border-white/10">
+                                                    <span className="text-gray-300 text-sm font-bold">Public Room</span>
+                                                    <button
+                                                        onClick={() => setIsPublic(!isPublic)}
+                                                        className={`w-12 h-6 rounded-full p-1 transition-colors ${isPublic ? 'bg-green-500' : 'bg-gray-600'}`}
+                                                    >
+                                                        <div className={`w-4 h-4 rounded-full bg-white shadow-md transition-transform ${isPublic ? 'translate-x-6' : 'translate-x-0'}`} />
+                                                    </button>
+                                                </div>
+
+                                                <button onClick={() => joinRoom(room || Math.random().toString(36).substring(2, 7), 'create')} className="w-full py-3 bg-green-500 rounded-xl font-bold text-white hover:bg-green-400 shadow-lg shadow-green-500/20">Create & Play</button>
                                             </div>
                                         </div>
                                     )}
@@ -406,11 +511,46 @@ function TicTacToe() {
                                         <div className="space-y-4">
                                             <div className="flex items-center justify-between border-b border-white/10 pb-2">
                                                 <button onClick={() => setOnlineView('menu')} className="text-gray-400 hover:text-white flex items-center gap-1 text-xs font-bold uppercase tracking-wider"><ArrowLeft size={14} /> Back</button>
-                                                <span className="text-white font-bold text-sm">JOIN ROOM</span>
+                                                <span className="text-white font-bold text-sm">BROWSE ROOMS</span>
                                             </div>
+
                                             <div className="flex gap-2">
-                                                <input type="text" placeholder="Room ID" className="flex-1 bg-black/40 border border-white/20 rounded-xl px-4 py-3 text-white focus:border-blue-500 outline-none font-mono text-sm shadow-inner" onChange={(e) => setRoom(e.target.value)} />
-                                                <button onClick={() => joinRoom(room, 'join')} className="px-6 bg-blue-500 rounded-xl font-bold text-white hover:bg-blue-400 shadow-lg shadow-blue-500/20">Join</button>
+                                                <input type="text" placeholder="Enter Room ID..." className="flex-1 bg-black/40 border border-white/20 rounded-xl px-4 py-2 text-white focus:border-blue-500 outline-none font-mono text-sm shadow-inner" onChange={(e) => setRoom(e.target.value)} />
+                                                <button onClick={() => joinRoom(room, 'join')} className="px-4 bg-blue-500 rounded-xl font-bold text-white hover:bg-blue-400 shadow-lg shadow-blue-500/20">Join</button>
+                                            </div>
+
+                                            <div className="space-y-2 max-h-[200px] overflow-y-auto pr-2 custom-scrollbar">
+                                                <div className="flex justify-between items-center text-xs text-gray-500 font-bold uppercase tracking-wider">
+                                                    <span>Public Rooms</span>
+                                                    <button
+                                                        onClick={() => {
+                                                            setIsRefreshing(true);
+                                                            socket.emit("get_public_rooms", { gameType: 'tictactoe' });
+                                                            setTimeout(() => setIsRefreshing(false), 1000);
+                                                        }}
+                                                        className={`text-blue-400 hover:text-white transition-all ${isRefreshing ? 'animate-spin' : ''}`}
+                                                    >
+                                                        <RefreshCw size={12} />
+                                                    </button>
+                                                </div>
+                                                {publicRooms.length === 0 ? (
+                                                    <div className="text-center py-8 text-gray-500 text-sm italic">No public rooms found. Create one!</div>
+                                                ) : (
+                                                    publicRooms.map(r => (
+                                                        <div key={r.id} className="flex items-center justify-between bg-white/5 p-3 rounded-xl border border-white/5 hover:border-white/20 hover:bg-white/10 transition-all group">
+                                                            <div>
+                                                                <div className="text-white font-mono font-bold">{r.id}</div>
+                                                                <div className="text-xs text-gray-400">{r.players}/{r.max} Players</div>
+                                                            </div>
+                                                            <button
+                                                                onClick={() => joinRoom(r.id, 'join')}
+                                                                className="px-3 py-1 bg-blue-500/20 text-blue-300 rounded-lg text-xs font-bold border border-blue-500/20 group-hover:bg-blue-500 group-hover:text-white transition-colors"
+                                                            >
+                                                                JOIN
+                                                            </button>
+                                                        </div>
+                                                    ))
+                                                )}
                                             </div>
                                         </div>
                                     )}
@@ -433,6 +573,14 @@ function TicTacToe() {
                                 (gameMode === 'online' && (!opponentPresent || mySymbol !== (xIsNext ? 'X' : 'O')))
                             }
                         />
+
+                        {gameMode === 'online' && !opponentPresent && (
+                            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm rounded-2xl">
+                                <div className="text-white text-xl font-bold mb-4 animate-pulse text-center px-4">Waiting for Opponent...</div>
+                                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
+                                <p className="text-gray-400 text-xs mt-4">Share Room ID: {room}</p>
+                            </div>
+                        )}
 
                         {/* Win Overlay is handled inside Board or mapped here? 
                             TTT Code had it separate. Reintegrating... 
@@ -484,26 +632,201 @@ function TicTacToe() {
                         <h3 className="text-sm font-bold mb-4 text-gray-400 uppercase">Status</h3>
 
                         {gameMode === 'online' && isRoomJoined && (
-                            <div className="mb-4 p-3 bg-blue-500/20 rounded-xl border border-blue-500/30 text-center">
-                                <p className="text-blue-300 font-bold">Room: {room}</p>
-                                <PingDisplay />
+                            <div className="mb-4 p-3 bg-blue-500/20 rounded-xl border border-blue-500/30">
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2">
+                                        <Share2 size={14} className="text-blue-400" />
+                                        <span className="text-blue-300 font-bold text-xs uppercase tracking-wider">Room Code</span>
+                                    </div>
+                                    <PingDisplay />
+                                </div>
+                                <div className="flex items-center gap-2 bg-black/40 rounded-lg p-2 border border-blue-500/20">
+                                    <code className="flex-1 font-mono text-center font-bold text-lg tracking-widest text-white">{room}</code>
+                                    <button
+                                        onClick={handleCopyLink}
+                                        className="p-2 hover:bg-white/10 rounded-lg transition-colors text-blue-400 relative group"
+                                        title="Copy Link"
+                                    >
+                                        {isCopied ? <Check size={16} /> : <Copy size={16} />}
+                                    </button>
+                                </div>
                             </div>
                         )}
 
                         <div className="space-y-3">
-                            <div className={`flex justify-between items-center p-3 rounded-xl border ${xIsNext ? 'bg-cyan-500/10 border-cyan-500/50' : 'border-white/5 bg-white/5'}`}>
+                            {/* Player X Status */}
+                            <div className={`flex justify-between items-center p-3 rounded-xl border relative ${xIsNext ? 'bg-cyan-500/10 border-cyan-500/50' : 'border-white/5 bg-white/5'}`}>
                                 <div className="flex items-center gap-3">
                                     <span className="font-bold text-cyan-400 text-xl">X</span>
-                                    <span className="text-gray-300 font-bold">Player X</span>
+                                    {editingName === 'X' && gameMode !== 'online' ? (
+                                        <input
+                                            autoFocus
+                                            className="bg-black/40 border border-white/20 rounded px-1 text-sm text-white w-24 focus:outline-none focus:border-cyan-500"
+                                            value={localNames.X || userName || 'Player X'}
+                                            onChange={(e) => setLocalNames(prev => ({ ...prev, X: e.target.value }))}
+                                            onBlur={() => setEditingName(null)}
+                                            onKeyDown={(e) => e.key === 'Enter' && setEditingName(null)}
+                                        />
+                                    ) : (
+                                        <div className="flex items-center gap-1 group">
+                                            <span className="text-gray-300 font-bold">
+                                                {gameMode === 'online'
+                                                    ? (playerNames[0] || (mySymbol === 'X' ? userName : 'Player X'))
+                                                    : (localNames.X || userName || 'Player X')}
+                                                {gameMode === 'online' && mySymbol === 'X' ? ' (You)' : ''}
+                                            </span>
+                                            {gameMode !== 'online' && (
+                                                <button
+                                                    onClick={() => setEditingName('X')}
+                                                    className="p-1 hover:bg-white/10 rounded transition-colors"
+                                                >
+                                                    <Pencil size={14} className="text-gray-500 hover:text-cyan-400" />
+                                                </button>
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
-                                {xIsNext && !winner && <span className="flex h-3 w-3 relative"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span><span className="relative inline-flex rounded-full h-3 w-3 bg-cyan-500"></span></span>}
+                                {gameMode === 'online' && mySymbol === 'X' && (
+                                    <div className="relative">
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setShowReactionPicker(!showReactionPicker); }}
+                                            className="w-6 h-6 hover:bg-white/10 rounded-full flex items-center justify-center transition-colors text-yellow-400/50 hover:text-yellow-400"
+                                        >
+                                            <Smile size={14} />
+                                        </button>
+
+                                        <AnimatePresence>
+                                            {showReactionPicker && (
+                                                <motion.div
+                                                    ref={reactionPickerRef}
+                                                    initial={{ scale: 0, opacity: 0 }}
+                                                    animate={{ scale: 1, opacity: 1 }}
+                                                    exit={{ scale: 0, opacity: 0 }}
+                                                    className="absolute right-0 top-full mt-2 bg-[#222] border border-white/20 rounded-xl p-2 shadow-xl grid grid-cols-3 gap-1 w-[120px] z-50 pointer-events-auto origin-top-right"
+                                                    onClick={(e) => e.stopPropagation()}
+                                                >
+                                                    {REACTION_EMOJIS.map(emoji => (
+                                                        <button
+                                                            key={emoji}
+                                                            onClick={() => sendReaction(emoji)}
+                                                            className="text-xl p-1 hover:bg-white/10 rounded cursor-pointer transition-colors transform hover:scale-110 active:scale-95"
+                                                        >
+                                                            {emoji}
+                                                        </button>
+                                                    ))}
+                                                </motion.div>
+                                            )}
+                                        </AnimatePresence>
+                                    </div>
+                                )}
+
+                                <AnimatePresence>
+                                    {activeReactions.filter(r => r.symbol === 'X').map(r => (
+                                        <motion.div
+                                            key={r.id}
+                                            initial={{ y: 0, opacity: 0, scale: 0.9 }}
+                                            animate={{
+                                                y: -120,
+                                                x: [0, (Math.random() - 0.5) * 80, (Math.random() - 0.5) * 80, 0],
+                                                opacity: [0, 1, 1, 0],
+                                                scale: [0.9, 1.1, 1]
+                                            }}
+                                            exit={{ opacity: 0 }}
+                                            transition={{ duration: 3, ease: "easeInOut" }}
+                                            className="absolute left-1/2 top-1/2 -translate-x-1/2 pointer-events-none text-4xl z-50"
+                                        >
+                                            {r.emoji}
+                                        </motion.div>
+                                    ))}
+                                </AnimatePresence>
+
                             </div>
-                            <div className={`flex justify-between items-center p-3 rounded-xl border ${!xIsNext ? 'bg-fuchsia-500/10 border-fuchsia-500/50' : 'border-white/5 bg-white/5'}`}>
+
+                            {/* Player O Status */}
+                            <div className={`flex justify-between items-center p-3 rounded-xl border relative ${!xIsNext ? 'bg-fuchsia-500/10 border-fuchsia-500/50' : 'border-white/5 bg-white/5'}`}>
                                 <div className="flex items-center gap-3">
                                     <span className="font-bold text-fuchsia-400 text-xl">O</span>
-                                    <span className="text-gray-300 font-bold">Player O</span>
+                                    {editingName === 'O' && gameMode !== 'online' ? (
+                                        <input
+                                            autoFocus
+                                            className="bg-black/40 border border-white/20 rounded px-1 text-sm text-white w-24 focus:outline-none focus:border-fuchsia-500"
+                                            value={localNames.O || 'Player O'}
+                                            onChange={(e) => setLocalNames(prev => ({ ...prev, O: e.target.value }))}
+                                            onBlur={() => setEditingName(null)}
+                                            onKeyDown={(e) => e.key === 'Enter' && setEditingName(null)}
+                                        />
+                                    ) : (
+                                        <div className="flex items-center gap-1 group">
+                                            <span className="text-gray-300 font-bold">
+                                                {gameMode === 'online'
+                                                    ? (playerNames[1] || (mySymbol === 'O' ? userName : 'Player O'))
+                                                    : (localNames.O || (gameMode === 'pve' ? 'AI Bot' : 'Player O'))}
+                                                {gameMode === 'online' && mySymbol === 'O' ? ' (You)' : ''}
+                                            </span>
+                                            {gameMode === 'pvp' && (
+                                                <button
+                                                    onClick={() => setEditingName('O')}
+                                                    className="p-1 hover:bg-white/10 rounded transition-colors"
+                                                >
+                                                    <Pencil size={14} className="text-gray-500 hover:text-fuchsia-400" />
+                                                </button>
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
-                                {!xIsNext && !winner && <span className="flex h-3 w-3 relative"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-fuchsia-400 opacity-75"></span><span className="relative inline-flex rounded-full h-3 w-3 bg-fuchsia-500"></span></span>}
+                                {gameMode === 'online' && mySymbol === 'O' && (
+                                    <div className="relative">
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setShowReactionPicker(!showReactionPicker); }}
+                                            className="w-6 h-6 hover:bg-white/10 rounded-full flex items-center justify-center transition-colors text-yellow-400/50 hover:text-yellow-400"
+                                        >
+                                            <Smile size={14} />
+                                        </button>
+
+                                        <AnimatePresence>
+                                            {showReactionPicker && (
+                                                <motion.div
+                                                    ref={reactionPickerRef}
+                                                    initial={{ scale: 0, opacity: 0 }}
+                                                    animate={{ scale: 1, opacity: 1 }}
+                                                    exit={{ scale: 0, opacity: 0 }}
+                                                    className="absolute right-0 top-full mt-2 bg-[#222] border border-white/20 rounded-xl p-2 shadow-xl grid grid-cols-3 gap-1 w-[120px] z-50 pointer-events-auto origin-top-right"
+                                                    onClick={(e) => e.stopPropagation()}
+                                                >
+                                                    {REACTION_EMOJIS.map(emoji => (
+                                                        <button
+                                                            key={emoji}
+                                                            onClick={() => sendReaction(emoji)}
+                                                            className="text-xl p-1 hover:bg-white/10 rounded cursor-pointer transition-colors transform hover:scale-110 active:scale-95"
+                                                        >
+                                                            {emoji}
+                                                        </button>
+                                                    ))}
+                                                </motion.div>
+                                            )}
+                                        </AnimatePresence>
+                                    </div>
+                                )}
+
+                                <AnimatePresence>
+                                    {activeReactions.filter(r => r.symbol === 'O').map(r => (
+                                        <motion.div
+                                            key={r.id}
+                                            initial={{ y: 0, opacity: 0, scale: 0.9 }}
+                                            animate={{
+                                                y: -120,
+                                                x: [0, (Math.random() - 0.5) * 80, (Math.random() - 0.5) * 80, 0],
+                                                opacity: [0, 1, 1, 0],
+                                                scale: [0.9, 1.1, 1.1]
+                                            }}
+                                            exit={{ opacity: 0 }}
+                                            transition={{ duration: 3, ease: "easeInOut" }}
+                                            className="absolute left-1/2 top-1/2 -translate-x-1/2 pointer-events-none text-4xl z-50"
+                                        >
+                                            {r.emoji}
+                                        </motion.div>
+                                    ))}
+                                </AnimatePresence>
                             </div>
                         </div>
                     </div>

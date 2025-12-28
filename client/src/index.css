@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+:root,
+body,
+html {
+    overscroll-behavior-y: none;
+    /* Disables pull-to-refresh on mobile */
+    /* overscroll-behavior-x: none; Disables swipe navigation if needed */
+}
+
 @media (pointer: fine) {
     * {
         cursor: none !important;
@@ -8,4 +16,68 @@
 
 * {
     color-scheme: dark;
+}
+
+@keyframes glitch-skew {
+    0% {
+        transform: skew(0deg);
+    }
+
+    20% {
+        transform: skew(-5deg);
+    }
+
+    21% {
+        transform: skew(5deg);
+    }
+
+    25% {
+        transform: skew(0deg);
+    }
+
+    100% {
+        transform: skew(0deg);
+    }
+}
+
+@keyframes glitch-color {
+    0% {
+        text-shadow: none;
+    }
+
+    20% {
+        text-shadow: 2px 0 #ff00c1, -2px 0 #00fff9;
+    }
+
+    21% {
+        text-shadow: -2px 0 #ff00c1, 2px 0 #00fff9;
+    }
+
+    25% {
+        text-shadow: none;
+    }
+
+    100% {
+        text-shadow: none;
+    }
+}
+
+@keyframes glitch-clip {
+
+    0%,
+    100% {
+        clip-path: inset(0 0 0 0);
+    }
+
+    20% {
+        clip-path: inset(20% 0 50% 0);
+    }
+
+    21% {
+        clip-path: inset(60% 0 10% 0);
+    }
+
+    25% {
+        clip-path: inset(0 0 0 0);
+    }
 }

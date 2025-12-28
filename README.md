@@ -27,7 +27,7 @@
 
 **Classic Game Hub** is a stunningly designed web application that brings your childhood favorite board games into the modern era. Featuring **Tic-Tac-Toe**, **Snake & Ladders**, and **Ludo**, this hub offers a seamless **Online Multiplayer** experience alongside local PvP and PvAI modes. 
 
-Built with a "Neon Retro" aesthetic, glassmorphism UI, and smooth Framer Motion animations, it's designed to look as good as it plays.
+Rebuilt for **v2.0** with a "Neon Retro" aesthetic, glassmorphism UI, client-side routing, and smooth Framer Motion animations, it's designed to look as good as it plays.
 
 ## 🚀 Features
 
@@ -36,16 +36,20 @@ Built with a "Neon Retro" aesthetic, glassmorphism UI, and smooth Framer Motion 
   - **Snake & Ladders**: Race to 100 with twists and turns.
   - **Ludo**: The ultimate 4-player strategy race.
 - **🌐 Real-Time Multiplayer**: Hosted on a custom Node.js/Socket.io server for lag-free online play.
+- **👤 Custom Name Profiles**: Set your unique identity that persists across local and online games.
+- **😃 Live Reactions**: Express yourself in real-time with an interactive emoji reaction system.
 - **🤖 Game Modes**:
   - **PvP (Local)**: Play on the same device.
   - **PvAI**: Challenge a smart AI bot (Tic-Tac-Toe & Snake & Ladders).
   - **Online**: Create or join rooms to play with friends anywhere. (*Note: This mode does not use optimistic updates; actions are confirmed by the server to ensure fairness. High ping may cause slight delays. The default server is located in Singapore; average ping tested in India is ~50ms on WiFi. If you face high latency, try hosting the server locally.*)
-- **🎙️ Real-Time Voice Chat**:
-  - **Peer-to-Peer**: Powered by WebRTC (via Simple Peer) for low-latency communication.
-  - **Full Control**: Mute microphone, deafen speakers, and see visual indicators of who is in the call.
-  - **Mobile Friendly**: Collapsible floating UI that stays out of your way while you play.
+- **🎙️ Real-Time Voice Chat 2.0**:
+  - **PeerJS Powered**: Completely overhauled voice stack using PeerJS for reliable, high-quality connections.
+  - **Visualizer UI**: Beautiful, morphing audio visualizations and "talking" indicators.
+  - **Full Control**: Mute, deafen, and collapsible floating UI.
 - **🎨 Premium UI/UX**:
-  - **Glassmorphism Design**: Sleek, modern, transparent aesthetics.
+  - **Glassmorphism Design**: Sleek, modern, transparent aesthetics with 3D-rendered assets.
+  - **Retro-Glitch Vibe**: Subtle digital glitch effects for a nostalgic arcade feel.
+  - **Seamless Navigation**: Smooth transitions between games using React Router.
   - **Dark Mode**: Optimized for comfortable gaming.
   - **Responsive**: Fully playable on Desktop and Mobile.
   - **PWA Support**: Installable as a native app on your device.

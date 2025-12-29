@@ -54,6 +54,10 @@ Rebuilt for **v2.0** with a "Neon Retro" aesthetic, glassmorphism UI, client-sid
   - **Responsive**: Fully playable on Desktop and Mobile.
   - **PWA Support**: Installable as a native app on your device.
 - **⚙️ Customization**: Configure your own custom server URL directly from the settings.
+- **🆓 100% Free**:
+  - Free to play.
+  - No ads.
+  - No in-app purchases.
 
 ## 🛠️ Technologies
 

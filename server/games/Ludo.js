@@ -1,8 +1,7 @@
-
 // Constants
 const SAFE_SPOTS = [0, 8, 13, 21, 26, 34, 39, 47];
 const HOME_START_TILES = [0, 13, 26, 39]; // Global start index for R, G, Y, B
-const MAIN_PATH_STEPS = 52; // Tokens stay on main path from relative 0 to 51
+const MAIN_PATH_STEPS = 51; // Tokens stay on main path from relative 0 to 50
 const WINNING_POS = 57; // Final home position
 const GLOBAL_PATH_LENGTH = 52; // Full loop length
 

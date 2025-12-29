@@ -24,7 +24,7 @@ import ConnectionStatus from './ConnectionStatus'
 import VoiceChat from './VoiceChat'
 
 const SAFE_SPOTS = [0, 8, 13, 21, 26, 34, 39, 47]; // Star positions global indices
-const HOME_ENTRY_POS = 51; // Last step on main path
+const HOME_ENTRY_POS = 50; // Last step on main path (relative 50)
 const WINNING_POS = 57; // Final position (Home)
 
 // Standard 15x15 Ludo Board Grid Coordinates
@@ -190,7 +190,7 @@ function Ludo() {
                     tokens: p.tokens.map((pos, tid) => ({
                         id: tid,
                         pos: pos,
-                        isFinished: pos >= 56 // Assumes 56 is winning pos
+                        isFinished: pos === 57 // Explicit check for winning pos
                     })),
                     finishedCount: p.finishedTokens || 0
                 }));

@@ -549,7 +549,7 @@ function SnakeAndLadders() {
 
         // Animate through each step
         for (let pos = startPos + 1; pos <= targetPos; pos++) {
-            await new Promise(resolve => setTimeout(resolve, 150)); // 150ms per step
+            await new Promise(resolve => setTimeout(resolve, 200)); // 200ms per step
             setPlayers(prev => prev.map((p, i) => i === playerIdx ? { ...p, pos } : p));
         }
 
@@ -627,6 +627,7 @@ function SnakeAndLadders() {
                                     <motion.div
                                         key={p.id}
                                         layoutId={`p${p.id}`}
+                                        transition={{ type: "spring", stiffness: 5000, damping: 300 }}
                                         className={`
                                         relative rounded-full border border-white shadow-sm
                                         w-3 h-3 sm:w-4 sm:h-4 lg:w-5 lg:h-5

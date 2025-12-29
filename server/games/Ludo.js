@@ -88,7 +88,8 @@ class Ludo {
 
             if (!hasPlayableMoves) {
                 this.moveLog.unshift(`P${playerIndex + 1} rolled ${this.diceValue} - No moves`);
-                this.nextTurn();
+                this.turnPhase = 'NO_MOVES'; // Wait for client to acknowledge
+                return { valid: true, state: this.getState() };
             } else {
                 if (this.diceValue === 6) {
                     this.consecutiveSixes++;
@@ -120,6 +121,7 @@ class Ludo {
                     player.tokens[tokenIndex] = 0;
                     this.moveLog.unshift(`P${playerIndex + 1} opened Token ${tokenIndex + 1}`);
                     this.turnPhase = 'ROLL';
+                    this.diceValue = null; // Allow re-roll after opening token
                 } else {
                     return { valid: false, error: "Need 6 to open" };
                 }
@@ -143,17 +145,25 @@ class Ludo {
                     if (conflict) {
                         this.moveLog.unshift(`P${playerIndex + 1} captured P${conflict.player + 1}!`);
                         this.turnPhase = 'ROLL';
+                        this.diceValue = null; // Allow re-roll after capture
                         return { valid: true, state: this.getState() };
                     }
                 }
 
                 if (this.diceValue === 6 || newPos === WINNING_POS) {
                     this.turnPhase = 'ROLL';
+                    this.diceValue = null; // Allow re-roll after 6 or reaching home
                 } else {
                     this.nextTurn();
                 }
             }
 
+            return { valid: true, state: this.getState() };
+        }
+
+        if (action === 'pass') {
+            if (this.turnPhase !== 'NO_MOVES') return { valid: false, error: "Cannot pass now" };
+            this.nextTurn();
             return { valid: true, state: this.getState() };
         }
 
@@ -206,8 +216,6 @@ class Ludo {
         let next = (this.currentTurn + 1) % 4;
         // Skip inactive, empty seats, or finished players (optional but good)
         // Ludo usually ends when one player wins (simplification), but if continuing, we'd check finished.
-        // Here we just fix the "empty seat" bug.
-        // We need a safety counter to avoid infinite loop if NO ONE is valid (shouldn't happen in game)
         let checked = 0;
         while ((!this.players[next].isActive || this.seats[next] === null) && checked < 4) {
             next = (next + 1) % 4;

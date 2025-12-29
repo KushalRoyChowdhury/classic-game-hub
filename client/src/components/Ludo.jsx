@@ -64,6 +64,7 @@ function Ludo() {
     const [turn, setTurn] = useState(0);
     const [dice, setDice] = useState(null);
     const [rolling, setRolling] = useState(false);
+    const rollingRef = useRef(false);
     const isAnimatingRef = useRef(false); // Ref to track animation state synchronously
     const [winner, setWinner] = useState(null);
     const [gameState, setGameState] = useState('setup');
@@ -109,6 +110,12 @@ function Ludo() {
             document.removeEventListener("mousedown", handleClickOutside);
         };
     }, [showReactionPicker]);
+
+    // Keep playersRef in sync for online movement logic
+    useEffect(() => {
+        playersRef.current = players;
+    }, [players]);
+
     useEffect(() => {
         // Check URL for room ID
         const searchParams = new URLSearchParams(window.location.search);
@@ -125,6 +132,16 @@ function Ludo() {
             }, 500);
         }
     }, []);
+
+    // Auto-Pass Logic for NO_MOVES
+    useEffect(() => {
+        if (gameMode === 'online' && turnPhase === 'NO_MOVES' && turn === myIndex) {
+            const timer = setTimeout(() => {
+                socket.emit("make_move", { room, action: 'pass' });
+            }, 1000);
+            return () => clearTimeout(timer);
+        }
+    }, [turnPhase, turn, myIndex, gameMode, room]);
 
     // Placeholder for playSound function
     const playSound = (soundName) => {
@@ -265,22 +282,23 @@ function Ludo() {
             if (data.currentTurn !== undefined) setTurn(data.currentTurn);
 
             // Dice Update with Animation Delay
-            if (data.diceValue !== undefined) {
-                if (rolling) {
+            if (data.diceValue !== undefined && data.diceValue !== null) {
+                if (rollingRef.current) {
                     // Force a minimum animation time if we were rolling locally
                     setTimeout(() => {
                         setDice(data.diceValue);
                         setRolling(false);
+                        rollingRef.current = false;
                     }, 600);
                 } else {
                     setDice(data.diceValue);
                     setRolling(false);
+                    rollingRef.current = false;
                 }
-            } else {
-                // strict check for null/undefined to allow 0 if that was a thing (it isn't)
-                // but if data.diceValue is explicitly null, we should reset?
-                // data.diceValue comes as number or null.
-                if (data.diceValue === null) setDice(null);
+            } else if (data.diceValue === null) {
+                setDice(null);
+                setRolling(false);
+                rollingRef.current = false;
             }
 
             // Remove direct setRolling(false) from here as it's handled above
@@ -500,6 +518,7 @@ function Ludo() {
             if (turnPhase !== 'ROLL') return; // Wrong phase
 
             setRolling(true); // Show animation immediately
+            rollingRef.current = true;
             socket.emit("make_move", {
                 room,
                 action: 'roll'
@@ -603,7 +622,7 @@ function Ludo() {
             const targetPos = Math.min(startPos + roll, WINNING_POS);
 
             for (let pos = startPos + 1; pos <= targetPos; pos++) {
-                await new Promise(resolve => setTimeout(resolve, 120)); // 120ms per step
+                await new Promise(resolve => setTimeout(resolve, 200)); // 200ms per step
                 setPlayers(prev => {
                     const updated = prev.map(p => ({
                         ...p,
@@ -871,12 +890,12 @@ function Ludo() {
                             <div className="flex gap-2">
                                 <input
                                     type="text"
-                                    placeholder="Enter Room ID"
+                                    placeholder="Room ID (Optional)"
                                     className="flex-1 bg-black/40 border border-white/20 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-green-500"
                                     value={room}
                                     onChange={(e) => setRoom(e.target.value)}
                                 />
-                                <button onClick={() => joinRoom(room, 'create', serverMaxPlayers)} className="bg-green-500 text-white px-6 rounded-xl font-bold">Create</button>
+                                <button onClick={() => joinRoom(room || Math.random().toString(36).substring(2, 7), 'create', serverMaxPlayers)} className="bg-green-500 text-white px-6 rounded-xl font-bold">Create</button>
                             </div>
                             <button onClick={() => setOnlineView('lobby')} className="w-full text-gray-400 hover:text-white">Back</button>
                         </div>
@@ -1102,7 +1121,7 @@ function Ludo() {
                                                         }`}
                                                     style={{ left: `${leftVal + 0.8}%`, top: `${topVal + 0.8}%` }} // Center in 6.66% box
                                                     animate={{ left: `${leftVal + 0.8}%`, top: `${topVal + 0.8}%` }}
-                                                    transition={isAnimating ? { type: "tween", duration: 0.15 } : { type: 'spring', stiffness: 200, damping: 20 }}
+                                                    transition={isAnimating ? { type: "spring", stiffness: 5000, damping: 300 } : { type: 'spring', stiffness: 200, damping: 20 }}
                                                     whileHover={isClickable ? { scale: 1.3 } : {}}
                                                 />
                                             );
@@ -1152,13 +1171,17 @@ function Ludo() {
                                         ${rolling ? 'animate-spin' : ''} transition-all
                                         ${players[turn]?.isAi || dice || (gameMode === 'online' && (turn !== myIndex || connectedPlayers < serverMaxPlayers))
                                             ? 'bg-gray-700 border-gray-600 text-gray-500 cursor-not-allowed opacity-50'
-                                            : 'bg-white text-black border-white hover:bg-gray-100 cursor-pointer'}
+                                            : 'bg-white text-black border-white hover:bg-gray-100 cursor-pointer animate-pulse'}
                                     `}
                                 >
                                     {rolling ? <RefreshCcw /> : (dice || <Dice5 />)}
                                 </motion.button>
                                 <p className="text-xs text-gray-400 text-center">
-                                    {dice ? 'Select a token' : players[turn]?.isAi ? 'AI thinking...' : (gameMode === 'online' && connectedPlayers < serverMaxPlayers) ? `Waiting for players (${connectedPlayers}/${serverMaxPlayers})...` : (gameMode === 'online' && turn !== myIndex) ? `Waiting for ${players[turn]?.color}...` : 'Roll dice'}
+                                    {turnPhase === 'NO_MOVES' ? 'No Moves!' :
+                                        turnPhase === 'MOVE' ? 'Select a token' :
+                                            players[turn]?.isAi ? 'AI thinking...' :
+                                                (gameMode === 'online' && connectedPlayers < serverMaxPlayers) ? `Waiting for players (${connectedPlayers}/${serverMaxPlayers})...` :
+                                                    (gameMode === 'online' && turn !== myIndex) ? `Waiting for ${players[turn]?.color}...` : 'Roll dice'}
                                 </p>
                             </div>
                         </div>

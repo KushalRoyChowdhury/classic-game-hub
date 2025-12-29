@@ -24,8 +24,8 @@ import ConnectionStatus from './ConnectionStatus'
 import VoiceChat from './VoiceChat'
 
 const SAFE_SPOTS = [0, 8, 13, 21, 26, 34, 39, 47]; // Star positions global indices
-const HOME_ENTRY_POS = 50; // Last step on main path
-const WINNING_POS = 56; // Final position (Home)
+const HOME_ENTRY_POS = 51; // Last step on main path
+const WINNING_POS = 57; // Final position (Home)
 
 // Standard 15x15 Ludo Board Grid Coordinates
 // Origin (0,0) top-left.
@@ -45,7 +45,8 @@ const MAIN_PATH_COORDS = [
     { x: 6, y: 13 }, { x: 6, y: 12 }, { x: 6, y: 11 }, { x: 6, y: 10 }, { x: 6, y: 9 }, // 39-43 (Up blue arm)
     { x: 5, y: 8 }, { x: 4, y: 8 }, { x: 3, y: 8 }, { x: 2, y: 8 }, { x: 1, y: 8 }, { x: 0, y: 8 }, // 44-49 (Left red arm)
     { x: 0, y: 7 }, // 50 (End of cycle)
-    // 51 is technically index 0 for next loop, but used for logic
+    { x: 0, y: 6 }, // 51 (Missing Corner)
+    // 52 is technically index 0 for next loop, but used for logic
     { x: 1, y: 6 } // 51 is basically index 0
 ];
 
@@ -63,6 +64,7 @@ function Ludo() {
     const [turn, setTurn] = useState(0);
     const [dice, setDice] = useState(null);
     const [rolling, setRolling] = useState(false);
+    const isAnimatingRef = useRef(false); // Ref to track animation state synchronously
     const [winner, setWinner] = useState(null);
     const [gameState, setGameState] = useState('setup');
     const [log, setLog] = useState([]);
@@ -207,6 +209,7 @@ function Ludo() {
 
                 if (moverIdx !== -1 && movedTokenIdx !== -1) {
                     setIsAnimating(true);
+                    isAnimatingRef.current = true;
                     const oldPos = currentPlayers[moverIdx].tokens[movedTokenIdx].pos;
                     const newPos = newRawPlayers[moverIdx].tokens[movedTokenIdx];
 
@@ -250,15 +253,38 @@ function Ludo() {
                     // ... implied by setPlayers(transformedPlayers)
 
                     setIsAnimating(false);
+                    isAnimatingRef.current = false;
                 } else {
                     // No detectable forward move (maybe capture only? or reset? or initial load?)
-                    setPlayers(transformedPlayers);
+                    // CRITICAL FIX: Only update if NOT animating to avoid teleportation/glitches
+                    if (!isAnimatingRef.current) {
+                        setPlayers(transformedPlayers);
+                    }
                 }
             }
             if (data.currentTurn !== undefined) setTurn(data.currentTurn);
-            if (data.diceValue !== undefined) setDice(data.diceValue);
-            // If diceValue becomes present, rolling should stop
-            if (data.diceValue) setRolling(false);
+
+            // Dice Update with Animation Delay
+            if (data.diceValue !== undefined) {
+                if (rolling) {
+                    // Force a minimum animation time if we were rolling locally
+                    setTimeout(() => {
+                        setDice(data.diceValue);
+                        setRolling(false);
+                    }, 600);
+                } else {
+                    setDice(data.diceValue);
+                    setRolling(false);
+                }
+            } else {
+                // strict check for null/undefined to allow 0 if that was a thing (it isn't)
+                // but if data.diceValue is explicitly null, we should reset?
+                // data.diceValue comes as number or null.
+                if (data.diceValue === null) setDice(null);
+            }
+
+            // Remove direct setRolling(false) from here as it's handled above
+            // if (data.diceValue) setRolling(false);
 
             if (data.turnPhase) setTurnPhase(data.turnPhase);
 
@@ -473,6 +499,7 @@ function Ludo() {
             if (turn !== myIndex) return; // Not my turn
             if (turnPhase !== 'ROLL') return; // Wrong phase
 
+            setRolling(true); // Show animation immediately
             socket.emit("make_move", {
                 room,
                 action: 'roll'
@@ -557,6 +584,7 @@ function Ludo() {
         const startPos = token.pos;
 
         setIsAnimating(true);
+        isAnimatingRef.current = true;
         setSelectedToken(null);
 
         if (startPos === -1) {
@@ -615,6 +643,7 @@ function Ludo() {
         }
 
         setIsAnimating(false);
+        isAnimatingRef.current = false;
 
         // Turn logic
         setTimeout(() => {
@@ -677,6 +706,9 @@ function Ludo() {
         if (gameMode === 'online') {
             if (playerId !== myIndex) return; // Can't move others
             if (turnPhase !== 'MOVE') return; // Must roll first
+
+            // Visual Feedback First
+            setSelectedToken(tokenId);
 
             // Server validates move legitimacy, we just emit intent
             socket.emit("make_move", {
@@ -905,12 +937,12 @@ function Ludo() {
             ) : gameState === 'playing' ? (
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 w-full">
                     {/* Board */}
-                    <div className="lg:col-span-2 flex justify-center">
+                    <div className="lg:col-span-2 flex justify-center aspect-square md:aspect-auto md:h-[600px]">
                         <div className="relative w-full max-w-[600px] aspect-square bg-white/5 rounded-2xl border-2 border-white/10 shadow-2xl p-3">
                             {/* Quadrants */}
                             <div className="absolute inset-0">
                                 {/* Red Area - Top Left */}
-                                <div className={`absolute top-[1%] left-[1%] w-[38%] h-[38%] rounded-3xl border-4 ${COLOR_STYLES.red.border}/30 ${COLOR_STYLES.red.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'red')?.isActive ? 'opacity-30' : ''}`}>
+                                <div className={`absolute top-[1%] left-[1%] w-[38%] aspect-square rounded-3xl border-4 ${COLOR_STYLES.red.border}/30 ${COLOR_STYLES.red.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'red')?.isActive ? 'opacity-30' : ''}`}>
                                     <div className="grid grid-cols-2 gap-3 w-1/2 aspect-square">
                                         {players.find(p => p.color === 'red')?.tokens.map((t, i) => (
                                             t.pos === -1 && (
@@ -929,7 +961,7 @@ function Ludo() {
                                 </div>
 
                                 {/* Green Area - Top Right */}
-                                <div className={`absolute top-[1%] right-[1%] w-[38%] h-[38%] rounded-3xl border-4 ${COLOR_STYLES.green.border}/30 ${COLOR_STYLES.green.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'green')?.isActive ? 'opacity-30' : ''}`}>
+                                <div className={`absolute top-[1%] right-[1%] w-[38%] aspect-square rounded-3xl border-4 ${COLOR_STYLES.green.border}/30 ${COLOR_STYLES.green.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'green')?.isActive ? 'opacity-30' : ''}`}>
                                     <div className="grid grid-cols-2 gap-3 w-1/2 aspect-square">
                                         {players.find(p => p.color === 'green')?.tokens.map((t, i) => (
                                             t.pos === -1 && (
@@ -948,7 +980,7 @@ function Ludo() {
                                 </div>
 
                                 {/* Yellow Area - Bottom Right */}
-                                <div className={`absolute bottom-[1%] right-[1%] w-[38%] h-[38%] rounded-3xl border-4 ${COLOR_STYLES.yellow.border}/30 ${COLOR_STYLES.yellow.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'yellow')?.isActive ? 'opacity-30' : ''}`}>
+                                <div className={`absolute bottom-[1%] right-[1%] w-[38%] aspect-square rounded-3xl border-4 ${COLOR_STYLES.yellow.border}/30 ${COLOR_STYLES.yellow.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'yellow')?.isActive ? 'opacity-30' : ''}`}>
                                     <div className="grid grid-cols-2 gap-3 w-1/2 aspect-square">
                                         {players.find(p => p.color === 'yellow')?.tokens.map((t, i) => (
                                             t.pos === -1 && (
@@ -967,7 +999,7 @@ function Ludo() {
                                 </div>
 
                                 {/* Blue Area - Bottom Left */}
-                                <div className={`absolute bottom-[1%] left-[1%] w-[38%] h-[38%] rounded-3xl border-4 ${COLOR_STYLES.blue.border}/30 ${COLOR_STYLES.blue.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'blue')?.isActive ? 'opacity-30' : ''}`}>
+                                <div className={`absolute bottom-[1%] left-[1%] w-[38%] aspect-square rounded-3xl border-4 ${COLOR_STYLES.blue.border}/30 ${COLOR_STYLES.blue.bg}/10 flex items-center justify-center ${!players.find(p => p.color === 'blue')?.isActive ? 'opacity-30' : ''}`}>
                                     <div className="grid grid-cols-2 gap-3 w-1/2 aspect-square">
                                         {players.find(p => p.color === 'blue')?.tokens.map((t, i) => (
                                             t.pos === -1 && (
@@ -987,7 +1019,7 @@ function Ludo() {
 
                                 {/* Main Path Rendering */}
                                 {MAIN_PATH_COORDS.map((coord, idx) => {
-                                    if (idx > 50) return null; // Skip overflow
+                                    if (idx > 51) return null; // Skip overflow
                                     const isSafe = SAFE_SPOTS.includes(idx);
                                     // Determine if this is a start spot for any color
                                     let startColor = null;
@@ -999,7 +1031,7 @@ function Ludo() {
                                     return (
                                         <div
                                             key={`path-${idx}`}
-                                            className={`absolute w-[6.66%] h-[6.66%] border border-white/10 flex items-center justify-center
+                                            className={`absolute w-[6.66%] aspect-square border border-white/10 flex items-center justify-center
                                             ${startColor ? `${COLOR_STYLES[startColor].bg} text-white` : isSafe ? 'bg-white/10' : 'bg-transparent'}
                                         `}
                                             style={{ left: `${coord.x * 6.66}%`, top: `${coord.y * 6.66}%` }}
@@ -1015,14 +1047,13 @@ function Ludo() {
                                     coords.map((coord, idx) => (
                                         <div
                                             key={`home-${color}-${idx}`}
-                                            className={`absolute w-[6.66%] h-[6.66%] border border-white/10 ${COLOR_STYLES[color].bg} opacity-20`}
+                                            className={`absolute w-[6.66%] aspect-square border border-white/10 ${COLOR_STYLES[color].bg} opacity-20`}
                                             style={{ left: `${coord.x * 6.66}%`, top: `${coord.y * 6.66}%` }}
                                         />
                                     ))
                                 ))}
 
-                                {/* Center Home */}
-                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[20%] h-[20%] bg-gradient-to-br from-purple-500/30 to-pink-500/30 rounded-full border-4 border-white/20 flex items-center justify-center shadow-[0_0_30px_rgba(255,255,255,0.1)]">
+                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[20%] aspect-square bg-gradient-to-br from-purple-500/30 to-pink-500/30 rounded-full border-4 border-white/20 flex items-center justify-center shadow-[0_0_30px_rgba(255,255,255,0.1)]">
                                     <Trophy className="text-yellow-400 drop-shadow-lg" size={32} />
                                 </div>
 
@@ -1066,13 +1097,12 @@ function Ludo() {
                                             return (
                                                 <motion.button
                                                     key={`${pIdx}-${tIdx}`}
-                                                    layout
                                                     onClick={() => isClickable && handleTokenClick(pIdx, tIdx)}
                                                     className={`absolute ${COLOR_STYLES[p.color].bg} w-[5%] aspect-square rounded-full border-2 border-white shadow-xl z-20 flex items-center justify-center ${isClickable ? `cursor-pointer ring-4 ${COLOR_STYLES[p.color].ring} animate-bounce` : ''
                                                         }`}
                                                     style={{ left: `${leftVal + 0.8}%`, top: `${topVal + 0.8}%` }} // Center in 6.66% box
                                                     animate={{ left: `${leftVal + 0.8}%`, top: `${topVal + 0.8}%` }}
-                                                    transition={{ type: 'spring', stiffness: 200, damping: 20 }}
+                                                    transition={isAnimating ? { type: "tween", duration: 0.15 } : { type: 'spring', stiffness: 200, damping: 20 }}
                                                     whileHover={isClickable ? { scale: 1.3 } : {}}
                                                 />
                                             );
@@ -1262,7 +1292,7 @@ function Ludo() {
 
                         {/* Log */}
                         <div className="bg-black/40 border border-white/5 rounded-2xl p-3 max-h-[200px]">
-                            <h4 className="text-xs font-bold text-gray-500 uppercase mb-2 sticky top-0 bg-black/90">Log</h4>
+                            <h4 className="text-xs font-bold text-gray-500 uppercase mb-2 sticky top-0">Log</h4>
                             <div className="space-y-1 text-xs font-mono">
                                 {log.map((l, i) => (
                                     <div key={i} className="text-gray-300 opacity-80 text-xs">

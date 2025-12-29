@@ -983,6 +983,7 @@ function SnakeAndLadders() {
 
                     {/* Move Log */}
                     <div className="bg-black/40 border border-white/5 rounded-2xl p-4 flex-1 overflow-y-auto h-[300px]">
+                        <h4 className="text-xs font-bold text-gray-500 uppercase mb-2 sticky top-0">Log</h4>
                         <div className="space-y-1 pr-2 text-xs font-mono text-gray-400">
                             {moveLog.map((log, i) => (
                                 <div key={i} className="border-b border-white/5 pb-1 last:border-0">{log}</div>

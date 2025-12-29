@@ -201,6 +201,7 @@ class Ludo {
     nextTurn() {
         this.consecutiveSixes = 0;
         this.turnPhase = 'ROLL';
+        this.diceValue = null;
 
         let next = (this.currentTurn + 1) % 4;
         // Skip inactive, empty seats, or finished players (optional but good)
